@@ -4,7 +4,7 @@
 
 Title: Clarity Execution Cost Assessment
 
-Author: Aaron Blankstein <aaron@blockstack.com>
+Author: Aaron Blankstein <aaron@blockstack.com>, Reed Rosenbluth <reed@blockstack.com>
 
 Status: Draft
 
@@ -22,6 +22,10 @@ _constants_ associated with those asymptotic cost functions. Those
 constants will necessarily be measured via benchmark harnesses and
 regression analyses. Furthermore, the _analysis_ cost associated with
 this code will not be covered by this proposal.
+
+The asymptotic cost functions for Clarity functions are modifiable
+via an on-chain voting mechanism. This enables new native functions to
+be added to the language over time.
 
 This document also describes the memory limit imposed during contract
 execution, and the memory model for enforcing that limit.
@@ -208,7 +212,11 @@ RUNTIME_COST = c*X+d
 
 where a, b, c, and d, are constants.
 
-# Native Function Costs
+# Initial Native Function Costs
+
+These are the initial set values for native function costs, however, these
+can be changed as described below in the [Cost Upgrades](#cost-upgrades)
+section of this document.
 
 ## Data, Token, Contract-Calls ##
 
@@ -746,3 +754,129 @@ types is defined as:
 * `map`: the size of stored key + the size of the stored value.
 * `nft`: the size of the NFT key
 * `ft`: the size of a Clarity uint value.
+
+# Cost Upgrades
+
+In order to enable the addition of new native functions to the Clarity
+language, there is a mechanism for voting on and changing a function's
+_cost-assessment function_ (the asymptotic function that describes its
+complexity and is used to calculate its cost). 
+
+New functions can be introduced to Clarity by first being implemented
+_in_ Clarity and published in a contract. This is necessary to avoid
+a hard fork of the blockchain and ensure the availability of the function
+across the network.
+
+If it is decided that a published function should be a part of the Clarity
+language, it can then be re-implemented as a native function in Rust and
+included in a future release of Clarity. Nodes running this upgraded VM
+would instead use this new native implementation of the function when they
+encounter Clarity code that references it via `contract-call?`.
+
+The new native function is likely faster and more efficient than the
+prior Clarity implementation, so a new cost-assessment function may need
+to be chosen for its evaluation. Until a new cost-assessment function is
+agreed upon, the cost of the Clarity implementation will continue to be used.
+
+## Voting on the Cost of Clarity Functions
+
+New and more accurate cost-assessment functions can be agreed upon as
+follows:
+
+1. A user formulates a cost-assessment function and publish it in a
+Clarity contract as a `read-only` function.
+2. The user proposes the cost-assessment function by calling the
+`propose-cost` function in the **Clarity Cost Voting Contract**.
+3. Voting on the proposed function ensues via the voting functions in
+the **Clarity Cost Voting Contract**, and the function is either
+selected as a replacement for the existing cost-assessment function,
+or ignored.
+
+### Publishing a Cost-Assessment Function
+
+Cost-assessment functions to be included in proposals can be published
+in Clarity contracts. They must be written precisely as follows:
+
+1. The function should be `read-only`.
+2. The function should return a tuple with the keys `runtime`, `write_length`,
+`write_count`, `read_count`, and `read_length` (the execution cost measurement
+[categories](#measurements-for-execution-cost)).
+3. The values of the returned tuple should be Clarity expressions representing
+the asymptotic cost functions.
+3. The expression's constants and variables should be listed as arguments
+to the Clarity function.
+    * The arguments should be written in alphabetical order, and variables
+    should come before constants.
+
+Here is an example of a cost-assessment function where the runtime
+is set to `a * log(n) + b`, and all of the other parameters are constant.
+
+```Lisp
+(define-read-only (runtime_cost (n int) (a int) (b int))
+  {
+     runtime: (+ (* a (log n)) b)
+     write_length: a,
+     write_count: a,
+     read_count: a,
+     read_length: a,
+  })
+```
+
+### Making a Cost-Assessment Function Proposal
+
+Stacks holders can propose cost-assessment functions by calling the
+`propose-cost` function in the **Clarity Cost Voting Contract**. It
+can be called like so:
+
+```Lisp
+(contract-call?
+   .propose-cost
+   qualified-function-name
+   cost-function-address
+   cost-function-name)
+
+```
+
+This function will return a response containing the details of the proposal,
+and a proposal ID, if successful.
+
+Once submitted, a proposal is valid until either a supermajority miner vote
+is achieved, or until it expires, 14 days from when it was submitted.
+
+### Viewing Cost-Assessment Proposals
+
+To view pending cost-assessment function proposals, one can use the 
+following functions in the **Clarity Cost Voting Contract**:
+
+- `(get-proposal (id int))` returns a single proposal
+- `(get-proposals)` returns a list of all pending proposals
+- `(get-proposals-function (qualified-name string-ascii))` returns a list of pending proposals for a specific
+function
+
+### Voting for a Cost-Assessment Proposal
+
+**Stacks Holders**
+
+Stacks holders can vote for a cost-assessment function proposal by calling
+the `(vote-for-proposal (id int))` function in the **Clarity Cost Voting
+Contract**. This function will tally your vote, weighting it by the size
+of your stacks holdings.
+
+Stacks holder votes help sway the miners one way or another on a proposal.
+However, they ultimately do not directly affect whether a proposal gets
+accepted.
+
+**Miners**
+
+Miners can vote by calling the `(vote-for-proposal-miner (id int))`. In order
+for a miner to have their vote counted, they must mine a block that includes
+the corresponding transaction. In other words, miners must **commit** their
+vote with their mining powere.
+
+A super majority of miners must vote for a proposal in order for it to be
+accepted.
+
+## Determining the Cost of a Clarity Function
+
+...
+
