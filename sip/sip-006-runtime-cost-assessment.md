@@ -855,26 +855,27 @@ function
 
 ### Voting for a Cost-Assessment Proposal
 
-**Stacks Holders**
-
-Stacks holders can vote for a cost-assessment function proposal by calling
-the `(vote-for-proposal (id int))` function in the **Clarity Cost Voting
-Contract**. This function will tally your vote, weighting it by the size
-of your stacks holdings.
-
-Stacks holder votes help sway the miners one way or another on a proposal.
-However, they ultimately do not directly affect whether a proposal gets
-accepted.
-
 **Miners**
 
-Miners can vote by calling the `(vote-for-proposal-miner (id int))`. In order
-for a miner to have their vote counted, they must mine a block that includes
-the corresponding transaction. In other words, miners must **commit** their
-vote with their mining powere.
+Miners can vote by creating a transaction that calls the cost assessment
+contract's `(vote (id int))` function and mining a block that includes this
+transaction. The `vote` function won't count the vote if the block wasn't
+mined by the node that signed that transaction. In other words, miners
+must **commit** their vote with their mining power.
 
 A super majority of miners must vote for a proposal in order for it to be
 accepted.
+
+**Stacks Holders**
+
+Stacks holders can signal their support for a cost-assessment function proposal
+by calling the `(signal (id int))` function in the **Clarity Cost
+Voting Contract**. These signals get weighted by the size of the signaler's
+STX holdings.
+
+Stacks holders signals help sway the miners one way or another on a proposal,
+however, they ultimately do not directly affect whether a proposal gets
+accepted by the miners.
 
 ## Determining the Cost of a Clarity Function
 
