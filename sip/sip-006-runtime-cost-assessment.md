@@ -783,8 +783,8 @@ agreed upon, the cost of the Clarity implementation will continue to be used.
 New and more accurate cost-assessment functions can be agreed upon as
 follows:
 
-1. A user formulates a cost-assessment function and publish it in a
-Clarity contract as a `read-only` function.
+1. A user formulates a cost-assessment function and publishes it in a
+Clarity contract as a `define-read-only` function.
 2. The user proposes the cost-assessment function by calling the
 `propose-cost` function in the **Clarity Cost Voting Contract**.
 3. Voting on the proposed function ensues via the voting functions in
@@ -841,14 +841,14 @@ This function will return a response containing the details of the proposal,
 and a proposal ID, if successful.
 
 Once submitted, a proposal is valid until either a supermajority miner vote
-is achieved, or until it expires, 14 days from when it was submitted.
+is achieved, or until it expires, 2016 Bitcoin blocks from when it was submitted.
 
 ### Viewing Cost-Assessment Proposals
 
 To view pending cost-assessment function proposals, one can use the 
 following functions in the **Clarity Cost Voting Contract**:
 
-- `(get-proposal (id int))` returns a single proposal
+- `(get-proposal (id uint))` returns a single proposal
 - `(get-proposals)` returns a list of all pending proposals
 - `(get-proposals-function (qualified-name string-ascii))` returns a list of pending proposals for a specific
 function
@@ -858,7 +858,7 @@ function
 **Miners**
 
 Miners can vote by creating a transaction that calls the cost assessment
-contract's `(vote (id int))` function and mining a block that includes this
+contract's `(vote (id uint))` function and mining a block that includes this
 transaction. The `vote` function won't count the vote if the block wasn't
 mined by the node that signed that transaction. In other words, miners
 must **commit** their vote with their mining power.
