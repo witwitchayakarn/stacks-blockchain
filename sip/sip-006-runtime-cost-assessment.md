@@ -812,7 +812,7 @@ Here is an example of a cost-assessment function where the runtime
 is set to `a * log(n) + b`, and all of the other parameters are constant.
 
 ```Lisp
-(define-read-only (runtime_cost (n int) (a int) (b int))
+(define-read-only (runtime_cost (n uint) (a uint) (b uint))
   {
      runtime: (+ (* a (log n)) b)
      write_length: a,
