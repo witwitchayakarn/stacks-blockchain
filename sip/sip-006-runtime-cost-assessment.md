@@ -814,44 +814,40 @@ is set to `a * log(n) + b`, and all of the other parameters are constant.
 ```Lisp
 (define-read-only (runtime_cost (n uint) (a uint) (b uint))
   {
-     runtime: (+ (* a (log n)) b)
-     write_length: a,
-     write_count: a,
-     read_count: a,
-     read_length: a,
+    runtime: (+ (* a (log n)) b)
+    write_length: a,
+    write_count: a,
+    read_count: a,
+    read_length: a,
   })
 ```
 
 ### Making a Cost-Assessment Function Proposal
 
 Stacks holders can propose cost-assessment functions by calling the
-`propose-cost` function in the **Clarity Cost Voting Contract**. It
-can be called like so:
+`submit-proposal` function in the **Clarity Cost Voting Contract**.
 
 ```Lisp
-(contract-call?
-   .propose-cost
-   qualified-function-name
-   cost-function-address
-   cost-function-name)
-
+(define-public (submit-proposal
+                (function-principal principal)
+                (function-name string-ascii)
+                (cost-function-principal principal)
+                (cost-function-name string-ascii))
+  ...
+)
 ```
 
-This function will return a response containing the details of the proposal,
-and a proposal ID, if successful.
+This function will return a response containing the proposal ID, if successful.
 
 Once submitted, a proposal is valid until either a supermajority miner vote
 is achieved, or until it expires, 2016 Bitcoin blocks from when it was submitted.
 
 ### Viewing Cost-Assessment Proposals
 
-To view pending cost-assessment function proposals, one can use the 
-following functions in the **Clarity Cost Voting Contract**:
+To view cost-assessment function proposals, one can use the 
+following function in the **Clarity Cost Voting Contract**:
 
-- `(get-proposal (id uint))` returns a single proposal
-- `(get-proposals)` returns a list of all pending proposals
-- `(get-proposals-function (qualified-name string-ascii))` returns a list of pending proposals for a specific
-function
+- `(get-proposal (id uint))` returns a proposal
 
 ### Voting for a Cost-Assessment Proposal
 
