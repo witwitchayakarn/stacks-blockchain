@@ -829,13 +829,22 @@ Stacks holders can propose cost-assessment functions by calling the
 
 ```Lisp
 (define-public (submit-proposal
-                (function-principal principal)
+                (function-contract-principal principal)
                 (function-name string-ascii)
-                (cost-function-principal principal)
+                (cost-function-contract-principal principal)
                 (cost-function-name string-ascii))
   ...
 )
 ```
+
+Description of `submit-proposal` arguments:
+- `function-contract-principal`: the principal of the contract that defines
+the function for which a cost is being proposed
+- `function-name`: the name of the function for which a cost is being proposed
+- `cost-function-contract-principal`: the principal of the contract that defines
+the cost function being proposed
+- `cost-function-name`: the name of the cost-function being proposed
+
 
 This function will return a response containing the proposal ID, if successful.
 
