@@ -803,22 +803,20 @@ in Clarity contracts. They must be written precisely as follows:
 [categories](#measurements-for-execution-cost)).
 3. The values of the returned tuple should be Clarity expressions representing
 the asymptotic cost functions.
-3. The expression's constants and variables should be listed as arguments
-to the Clarity function.
-    * The arguments should be written in alphabetical order, and variables
-    should come before constants.
+3. The expression's variables should be listed as arguments to the Clarity
+function, in the order they appear in the expression.
 
 Here is an example of a cost-assessment function where the runtime
-is set to `a * log(n) + b`, and all of the other parameters are constant.
+is set to `2log(n) + 3`, and all of the other parameters are `0`.
 
 ```Lisp
-(define-read-only (runtime_cost (n uint) (a uint) (b uint))
+(define-read-only (runtime_cost (n uint))
   {
-    runtime: (+ (* a (log n)) b)
-    write_length: a,
-    write_count: a,
-    read_count: a,
-    read_length: a,
+    runtime: (+ (* 2 (log n)) 3)
+    write_length: 0,
+    write_count: 0,
+    read_count: 0,
+    read_length: 0,
   })
 ```
 
