@@ -1,0 +1,19 @@
+FROM rust:buster
+
+WORKDIR /build
+
+RUN rustup override set nightly
+RUN cargo install grcov
+
+ENV CARGO_INCREMENTAL 0
+ENV RUSTFLAGS -Zprofile -Copt-level=0 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort
+ENV RUSTDOCFLAGS -Cpanic=abort
+    
+COPY . .
+
+RUN cargo test -j 1 --no-run
+RUN cargo test
+RUN zip -0 /tmp/ccov.zip `find . \( -name "blockstack_*.gc*" \) -print` &&  grcov /tmp/ccov.zip -s . -t html --llvm --ignore-not-existing --ignore "/*" -o /out/codecov;
+
+# FROM scratch AS export-stage
+# COPY --from=build /out/codecov /
