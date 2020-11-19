@@ -786,7 +786,7 @@ follows:
 1. A user formulates a cost-assessment function and publishes it in a
 Clarity contract as a `define-read-only` function.
 2. The user proposes the cost-assessment function by calling the
-`propose-cost` function in the **Clarity Cost Voting Contract**.
+`propose-cost-function` function in the **Clarity Cost Voting Contract**.
 3. Voting on the proposed function ensues via the voting functions in
 the **Clarity Cost Voting Contract**, and the function is either
 selected as a replacement for the existing cost-assessment function,
@@ -797,14 +797,14 @@ or ignored.
 Cost-assessment functions to be included in proposals can be published
 in Clarity contracts. They must be written precisely as follows:
 
-1. The function should be `read-only`.
-2. The function should return a tuple with the keys `runtime`, `write_length`,
+1. The function must be `read-only`.
+2. The function must return a tuple with the keys `runtime`, `write_length`,
 `write_count`, `read_count`, and `read_length` (the execution cost measurement
 [categories](#measurements-for-execution-cost)).
-3. The values of the returned tuple should be Clarity expressions representing
-the asymptotic cost functions.
-3. The expression's variables should be listed as arguments to the Clarity
-function, in the order they appear in the expression.
+3. The values of the returned tuple must be Clarity expressions representing
+the asymptotic cost functions. These expressions must be limited to **arithmetic operations**.
+3. Variables used in these expressions must be listed as arguments to the Clarity
+function.
 
 Here is an example of a cost-assessment function where the runtime
 is set to `2log(n) + 3`, and all of the other parameters are `0`.
@@ -823,19 +823,19 @@ is set to `2log(n) + 3`, and all of the other parameters are `0`.
 ### Making a Cost-Assessment Function Proposal
 
 Stacks holders can propose cost-assessment functions by calling the
-`submit-proposal` function in the **Clarity Cost Voting Contract**.
+`propose-cost-function` function in the **Clarity Cost Voting Contract**.
 
 ```Lisp
-(define-public (submit-proposal
-                (function-contract-principal principal)
-                (function-name string-ascii)
-                (cost-function-contract-principal principal)
-                (cost-function-name string-ascii))
+(define-public (propose-cost-function
+    (function-contract-principal principal)
+    (function-name string-ascii)
+    (cost-function-contract-principal principal)
+    (cost-function-name string-ascii))
   ...
 )
 ```
 
-Description of `submit-proposal` arguments:
+Description of `propose-cost-function` arguments:
 - `function-contract-principal`: the principal of the contract that defines
 the function for which a cost is being proposed
 - `function-name`: the name of the function for which a cost is being proposed
@@ -843,44 +843,122 @@ the function for which a cost is being proposed
 the cost function being proposed
 - `cost-function-name`: the name of the cost-function being proposed
 
-
 This function will return a response containing the proposal ID, if successful.
 
 Once submitted, a proposal is valid until either a supermajority miner vote
 is achieved, or until it expires, 2016 Bitcoin blocks from when it was submitted.
 
-### Viewing Cost-Assessment Proposals
+Usage:
+```Lisp
+(contract-call?
+    .cost-voting-contract
+    "propose-cost-function"
+    .new-cost-function-contract
+    "new-cost-function-name"
+)
+```
 
-To view cost-assessment function proposals, one can use the 
-following function in the **Clarity Cost Voting Contract**:
+### Viewing a Cost-Assessment Proposal
 
-- `(get-proposal (id uint))` returns a proposal
+To view cost-assessment function proposals, you can use the 
+`get-proposal` function in the **Clarity Cost Voting Contract**:
+
+```Lisp
+(define-read-only (get-proposal (proposal-id uint))
+  ...
+)
+```
+
+This function takes a proposal ID and returns a **response** containing the proposal,
+if a proposal with the supplied ID exists, or an error code. Proposals contain information
+about their voting status, and take the following form:
+
+```Lisp
+(tuple
+    (cost-function-name string-ascii)
+    (cost-function-contract principal)
+    (votes uint)
+    (expiration-block-height uint)
+)
+```
+
+Usage:
+```Lisp
+(contract-call? .cost-voting-contract "get-proposal" 123)
+```
 
 ### Voting for a Cost-Assessment Proposal
 
-**Miners**
+Miners can vote for cost-function proposals by creating a transaction that calls
+the cost assessment contract's `vote-cost-proposal` function and mining a block
+that includes this transaction. The `vote-cost-proposal` function won't count
+the vote if the block wasn't mined by the node that signed that transaction.
+In other words, miners must **commit** their vote with their mining power.
 
-Miners can vote by creating a transaction that calls the cost assessment
-contract's `(vote (id uint))` function and mining a block that includes this
-transaction. The `vote` function won't count the vote if the block wasn't
-mined by the node that signed that transaction. In other words, miners
-must **commit** their vote with their mining power.
+Usage:
+```Lisp
+(contract-call? .cost-voting-contract "vote-cost-proposal" 123)
+```
 
-A super majority of miners must vote for a proposal in order for it to be
-accepted.
+This function will return a successful response if the vote was counted, or
+an error if the vote failed.
 
-**Stacks Holders**
+### Confirming the Result of a Vote
 
-Stacks holders can signal their support for a cost-assessment function proposal
-by calling the `(signal (id int))` function in the **Clarity Cost
-Voting Contract**. These signals get weighted by the size of the signaler's
-STX holdings.
+In order for voting on a proposed cost-function conclude, and a the cost-function
+to take effect (or not), the proposal must be *confirmed*. Any stacks holder can
+call the `confirm-cost-proposal` function in the **Clarity Cost Voting Contract** to
+attempt confirmation. In order for confirmation to succeed, the following criteria
+must be met:
 
-Stacks holders signals help sway the miners one way or another on a proposal,
-however, they ultimately do not directly affect whether a proposal gets
-accepted by the miners.
+1. The proposal must receive `yes` votes representing a supermajority (80%) of the miners
+who have mined the blocks since the inception of the proposal.
 
-## Determining the Cost of a Clarity Function
+    Since 2016 blocks will be mined during the course of a cost-function referendum,
+    1,612 of those blocks must be mined by a miner who voted `yes` to represent a
+    supermajority of the hash power.
+     
+2. The proposal must not be expired.
 
-...
+    This means that the `confirm-cost-proposal` function must be called before the
+    `expiration-block-height` has been reached.
+    
+Usage:
+```Lisp
+(contract-call? .cost-voting-contract "confirm-cost-proposal" 123)
+```
 
+This function will return a response either containing the confirmed proposal, or an
+error if the confirmation failed.
+
+### Rolling Back
+
+If for whatever reason it is deemed that the selection of a new cost-function
+via the procedure described above was a mistake, the miners can vote to roll
+back to the previously agreed upon cost-function. The process for this is quite
+similar to the process for proposing and voting upon cost-functions described above.
+
+First, a rollback must be proposed:
+```Lisp
+(contract-call? .cost-voting-contract "propose-rollback" "cost-function-name")
+```
+
+The `propose-rollback` function will return a `rollback-id`.
+
+Proposed rollbacks can be viewed with the `get-rollback` function, passing it a
+`rollback-id`:
+```Lisp
+(contract-call? .cost-voting-contract "get-rollback" 321)
+```
+
+Next, voting by the miners ensues. Miners vote using the `vote-rollback` function,
+passing it a `rollback-id`:
+```Lisp
+(contract-call? .cost-voting-contract "vote-rollback" 321)
+```
+
+Finally, the rollback must be confirmed. It must meet the same criteria as a
+normal cost-function proposal, described above.
+```Lisp
+(contract-call? .cost-voting-contract "confirm-rollback" 321)
+```
