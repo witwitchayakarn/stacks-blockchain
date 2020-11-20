@@ -786,7 +786,7 @@ follows:
 1. A user formulates a cost-assessment function and publishes it in a
 Clarity contract as a `define-read-only` function.
 2. The user proposes the cost-assessment function by calling the
-`propose-cost-function` function in the **Clarity Cost Voting Contract**.
+`submit-proposal` function in the **Clarity Cost Voting Contract**.
 3. Voting on the proposed function ensues via the voting functions in
 the **Clarity Cost Voting Contract**, and the function is either
 selected as a replacement for the existing cost-assessment function,
@@ -823,62 +823,63 @@ is set to `2log(n) + 3`, and all of the other parameters are `0`.
 ### Making a Cost-Assessment Function Proposal
 
 Stacks holders can propose cost-assessment functions by calling the
-`propose-cost-function` function in the **Clarity Cost Voting Contract**.
+`submit-proposal` function in the **Clarity Cost Voting Contract**.
 
 ```Lisp
-(define-public (propose-cost-function
-    (function-contract-principal principal)
+(define-public (submit-proposal
+    (function-contract principal)
     (function-name string-ascii)
-    (cost-function-contract-principal principal)
+    (cost-function-contract principal)
     (cost-function-name string-ascii))
   ...
 )
 ```
 
-Description of `propose-cost-function` arguments:
-- `function-contract-principal`: the principal of the contract that defines
+Description of `submit-proposal` arguments:
+- `function-contract`: the principal of the contract that defines
 the function for which a cost is being proposed
 - `function-name`: the name of the function for which a cost is being proposed
 - `cost-function-contract-principal`: the principal of the contract that defines
 the cost function being proposed
 - `cost-function-name`: the name of the cost-function being proposed
 
-This function will return a response containing the proposal ID, if successful.
-
-Once submitted, a proposal is valid until either a supermajority miner vote
-is achieved, or until it expires, 2016 Bitcoin blocks from when it was submitted.
+This function will return a response containing the proposal ID, if successful,
+and an error otherwise.
 
 Usage:
 ```Lisp
 (contract-call?
     .cost-voting-contract
-    "propose-cost-function"
+    "submit-proposal"
+    .function-contract
+    "function-name"
     .new-cost-function-contract
     "new-cost-function-name"
 )
 ```
 
-### Viewing a Cost-Assessment Proposal
+### Viewing a Proposal
 
 To view cost-assessment function proposals, you can use the 
 `get-proposal` function in the **Clarity Cost Voting Contract**:
 
 ```Lisp
-(define-read-only (get-proposal (proposal-id uint))
-  ...
-)
+(define-read-only (get-proposal (proposal-id uint)) ... )
 ```
 
-This function takes a proposal ID and returns a **response** containing the proposal,
-if a proposal with the supplied ID exists, or an error code. Proposals contain information
-about their voting status, and take the following form:
+This function takes a `proposal-id` and returns a response containing the proposal
+data tuple, if a proposal with the supplied ID exists, or an error code. Proposal
+data tuples contain information about the state of the proposal, and take the
+following form:
 
 ```Lisp
 (tuple
-    (cost-function-name string-ascii)
+    (function-contract principal)
+    (function-name (string-ascii 50))
     (cost-function-contract principal)
+    (cost-function-name (string-ascii 50))
     (votes uint)
-    (expiration-block-height uint)
+    (expiration-height uint)
 )
 ```
 
@@ -887,63 +888,116 @@ Usage:
 (contract-call? .cost-voting-contract "get-proposal" 123)
 ```
 
-### Voting for a Cost-Assessment Proposal
+### Voting
 
-Miners can vote for cost-function proposals by creating a transaction that calls
-the cost assessment contract's `vote-cost-proposal` function and mining a block
-that includes this transaction. The `vote-cost-proposal` function won't count
-the vote if the block wasn't mined by the node that signed that transaction.
-In other words, miners must **commit** their vote with their mining power.
+#### Stacks Holders
+
+Stacks holders can vote for cost-assessment function proposals by calling the
+**Clarity Cost Voting Contract's** `vote` function. The `vote` function takes
+two arguments, `proposal-id` and `amount`. `proposal-id` is the ID of the proposal
+being voted for. `amount` is the amount of STX the voter would like to vote *with*.
+The amount of STX you include is the number of votes you are casting.
+
+Calling the `vote` function authorizes the contract to transfer STX out
+of the caller's address, and into the address of the contract. The equivalent
+amount of `CFV` (Cost Function Voting) tokens will be distributed to the voter,
+representing the amount of STX they have staked in the voting contract.
+
+Some, or all, of the STX staked for voting can be withdrawn *prior* to the confirmation
+of a proposal with the `withdraw-vote` function, or all of the STX can be withdrawn
+*after* the votes are counted (and the proposal is confirmed) with the `withdraw-after-vote`
+function. If staked STX are withdrawn prior to confirmation, they will not be counted
+as votes.
+
+Upon withdrawal, the voter permits the contract to reclaim allocated `CFV` tokens,
+and will receive the equivalent amount of their staked STX tokens.
+
+**Voting example**
+```Lisp
+(contract-call? .cost-voting-contract "vote" 123 10000)
+```
+
+The `vote` function will return a successful response if the STX were staked for
+voting, or an error if the staking failed.
+
+**Withdrawal example**
+```Lisp
+(contract-call? .cost-voting-contract "withdraw-vote" 123 10000)
+```
+
+Like the `vote` function, the `withdraw-vote` function expects a `proposal-id` and
+an `amount`, letting the voter withdraw some or all of their staked STX. This function
+will return a successful response if the STX were withdrawn, and an error otherwise.
+
+```Lisp
+(contract-call? .cost-voting-contract "withdraw-after-vote" 123)
+```
+
+Like the `withdraw-vote` function, `withdraw-after-vote` expects a `proposal-id`, but
+it does not take an `amount`. It can only be called after the proposal has expired,
+and will transfer back to the voter all of their staked STX. This function will return
+a successful response if the STX were withdrawn, and an error otherwise.
+
+#### Miners
+
+Miners can vote *against* (veto) cost-function proposals by creating a transaction that
+calls the **Clarity Cost Voting Contract's** `veto-cost-proposal` function and mining
+a block that includes this transaction. The `veto-cost-proposal` function won't count
+the veto if the block wasn't mined by the node that signed that transaction.
+In other words, miners must **commit** their veto with their mining power.
 
 Usage:
 ```Lisp
 (contract-call? .cost-voting-contract "vote-cost-proposal" 123)
 ```
 
-This function will return a successful response if the vote was counted, or
-an error if the vote failed.
+This function will return a successful response if the veto was counted, or
+an error if the veto failed.
 
 ### Confirming the Result of a Vote
 
-In order for voting on a proposed cost-function conclude, and a the cost-function
-to take effect (or not), the proposal must be *confirmed*. Any stacks holder can
-call the `confirm-cost-proposal` function in the **Clarity Cost Voting Contract** to
-attempt confirmation. In order for confirmation to succeed, the following criteria
-must be met:
+In order for voting on a proposed cost-function conclude, and a verdict to be reached
+on whether or not it should be accepted, the proposal must be *confirmed*. 
+Any stacks holder can call the `confirm-cost-proposal` function in the **Clarity
+Cost Voting Contract** to attempt confirmation. In order for confirmation to succeed,
+the following criteria must be met:
 
-1. The proposal must receive `yes` votes representing a supermajority (80%) of the miners
-who have mined the blocks since the inception of the proposal.
+1. The proposal must receive votes representing 20% of the liquid supply of STX, meaning
+the proposals vote count divided by the supply of liquid STX is greater than or equal
+to `0.2`.
 
-    Since 2016 blocks will be mined during the course of a cost-function referendum,
-    1,612 of those blocks must be mined by a miner who voted `yes` to represent a
-    supermajority of the hash power.
-     
-2. The proposal must not be expired.
+2. The proposal must not be expired, meaning its `expiration-height` must
+not have been reached.
 
-    This means that the `confirm-cost-proposal` function must be called before the
-    `expiration-block-height` has been reached.
-    
-Usage:
+A confirmation will fail if a supermajority (80%) of miners have vetoed it, regardless
+of how many votes the proposal has accrued from STX holders. The following calculation
+is used to determine if a veto should take effect:
+
+```
+(vetos / blocks-since-proposal) >= 0.8
+```
+
+Example of `confirm-cost-proposal` usage:
 ```Lisp
 (contract-call? .cost-voting-contract "confirm-cost-proposal" 123)
 ```
 
-This function will return a response either containing the confirmed proposal, or an
+This function will return a response either containing the confirmed proposal ID, or an
 error if the confirmation failed.
 
 ### Rolling Back
 
 If for whatever reason it is deemed that the selection of a new cost-function
-via the procedure described above was a mistake, the miners can vote to roll
-back to the previously agreed upon cost-function. The process for this is quite
-similar to the process for proposing and voting upon cost-functions described above.
+was a mistake, the miners can vote to roll back to the previously agreed upon
+cost-function. The process for this is quite similar to the process for proposing
+and voting upon cost-functions described above.
 
-First, a rollback must be proposed:
+First, a rollback **proposal** must be submitted:
 ```Lisp
-(contract-call? .cost-voting-contract "propose-rollback" "cost-function-name")
+(contract-call? .cost-voting-contract "submit-rollback-proposal" "cost-function-name")
 ```
 
-The `propose-rollback` function will return a `rollback-id`.
+The `submit-rollback-proposal` function will return a `rollback-id`.
 
 Proposed rollbacks can be viewed with the `get-rollback` function, passing it a
 `rollback-id`:
@@ -951,14 +1005,32 @@ Proposed rollbacks can be viewed with the `get-rollback` function, passing it a
 (contract-call? .cost-voting-contract "get-rollback" 321)
 ```
 
-Next, voting by the miners ensues. Miners vote using the `vote-rollback` function,
-passing it a `rollback-id`:
+Next, **voting** ensues.
+
+STX holders vote using the `vote-rollback` function, passing it a `rollback-id`,
+and a vote `amount`:
 ```Lisp
-(contract-call? .cost-voting-contract "vote-rollback" 321)
+(contract-call? .cost-voting-contract "vote-rollback" 321 10000)
 ```
 
-Finally, the rollback must be confirmed. It must meet the same criteria as a
-normal cost-function proposal, described above.
+Miners **veto** using the `veto-rollback` function, passing it a `rollback-id`:
+```Lisp
+(contract-call? .cost-voting-contract "veto-rollback" 321)
+```
+
+Rollback **vote withdrawal** is much the same as normal proposal vote withdrawal.
+
+```Lisp
+(contract-call? .cost-voting-contract "withdraw-rollback-vote" 123 10000)
+```
+
+```Lisp
+(contract-call? .cost-voting-contract "withdraw-after-rollback-vote" 123)
+```
+
+Finally, rollback **confirmation** is almost exactly the same has normal proposal
+confirmation. It must meet the same criteria, described above.
+
 ```Lisp
 (contract-call? .cost-voting-contract "confirm-rollback" 321)
 ```
