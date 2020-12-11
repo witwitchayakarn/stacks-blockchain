@@ -29,6 +29,7 @@ pub mod operations;
 pub mod run_loop;
 pub mod syncctl;
 pub mod tenure;
+pub mod burn_fee;
 
 pub use self::burnchains::{
     BitcoinRegtestController, BurnchainController, BurnchainTip, MocknetController,

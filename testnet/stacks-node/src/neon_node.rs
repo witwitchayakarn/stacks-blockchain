@@ -58,6 +58,8 @@ use stacks::vm::database::BurnStateDB;
 
 use stacks::monitoring::{increment_stx_blocks_mined_counter, update_active_miners_count_gauge};
 
+use crate::burn_fee::read_burn_fee;
+
 pub const TESTNET_CHAIN_ID: u32 = 0x80000000;
 pub const TESTNET_PEER_VERSION: u32 = 0xfacade01;
 pub const RELAYER_MAX_BUFFER: usize = 100;
@@ -1153,8 +1155,10 @@ impl InitializedNeonNode {
             }
         };
 
-        let sunset_burn = burnchain.expected_sunset_burn(burn_block.block_height + 1, burn_fee_cap);
-        let rest_commit = burn_fee_cap - sunset_burn;
+        let dyn_burn_fee_cap = read_burn_fee();
+        let sunset_burn = burnchain.expected_sunset_burn(burn_block.block_height + 1, dyn_burn_fee_cap);
+        let rest_commit = dyn_burn_fee_cap - sunset_burn;
+        info!("BURN-FEE: In relayer_run_tenure, burn_fee_cap: {}, dyn_burn_fee_cap: {}, sunset_burn: {}, rest_commit: {}", burn_fee_cap, dyn_burn_fee_cap, sunset_burn, rest_commit);
 
         let commit_outs = if burn_block.block_height + 1 < burnchain.pox_constants.sunset_end {
             RewardSetInfo::into_commit_outs(recipients, false)
