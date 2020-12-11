@@ -32,8 +32,12 @@ use vm::contexts::{ContractContext, Environment, GlobalContext, OwnedEnvironment
 use vm::costs::cost_functions::ClarityCostFunction;
 use vm::database::{marf::NullBackingStore, ClarityDatabase, MemoryBackingStore};
 use vm::errors::{Error, InterpreterResult};
+use vm::types::signatures::FunctionType::Fixed;
 use vm::types::Value::UInt;
-use vm::types::{PrincipalData, QualifiedContractIdentifier, TupleData, TypeSignature, NONE};
+use vm::types::{
+    FunctionArg, FunctionType, PrincipalData, QualifiedContractIdentifier, TupleData,
+    TypeSignature, NONE,
+};
 use vm::{ast, eval_all, ClarityName, SymbolicExpression, Value};
 
 type Result<T> = std::result::Result<T, CostErrors>;
@@ -46,7 +50,7 @@ pub fn runtime_cost<T: TryInto<u64>, C: CostTracker>(
     input: T,
 ) -> Result<()> {
     let size: u64 = input.try_into().map_err(|_| CostErrors::CostOverflow)?;
-    let cost = tracker.compute_cost(cost_function, size)?;
+    let cost = tracker.compute_cost(cost_function, vec![size])?;
 
     tracker.add_cost(cost)
 }
@@ -68,7 +72,7 @@ pub fn analysis_typecheck_cost<T: CostTracker>(
     let t2_size = t2.type_size().map_err(|_| CostErrors::CostOverflow)?;
     let cost = track.compute_cost(
         ClarityCostFunction::AnalysisTypeCheck,
-        cmp::max(t1_size, t2_size) as u64,
+        vec![cmp::max(t1_size, t2_size) as u64],
     )?;
     track.add_cost(cost)
 }
@@ -87,7 +91,7 @@ pub trait CostTracker {
     fn compute_cost(
         &mut self,
         cost_function: ClarityCostFunction,
-        input: u64,
+        input: Vec<u64>,
     ) -> Result<ExecutionCost>;
     fn add_cost(&mut self, cost: ExecutionCost) -> Result<()>;
     fn add_memory(&mut self, memory: u64) -> Result<()>;
@@ -109,7 +113,7 @@ impl CostTracker for () {
     fn compute_cost(
         &mut self,
         _cost_function: ClarityCostFunction,
-        _input: u64,
+        _input: Vec<u64>,
     ) -> std::result::Result<ExecutionCost, CostErrors> {
         Ok(ExecutionCost::zero())
     }
@@ -404,7 +408,9 @@ fn load_cost_functions(clarity_db: &mut ClarityDatabase) -> Result<CostStateSumm
 
         // make sure the contract is "cost contract eligible" via the
         //  arithmetic-checking analysis pass
-        let cost_func_ref = match clarity_db.load_contract_analysis(&cost_contract) {
+        let (cost_func_ref, cost_func_type) = match clarity_db
+            .load_contract_analysis(&cost_contract)
+        {
             Some(c) => {
                 if !c.is_cost_contract_eligible {
                     warn!("Confirmed cost proposal invalid: cost-function-contract uses non-arithmetic or otherwise illegal operations";
@@ -413,10 +419,15 @@ fn load_cost_functions(clarity_db: &mut ClarityDatabase) -> Result<CostStateSumm
                     );
                     continue;
                 }
-                if !c.public_function_types.contains_key(&cost_function)
-                    && !c.read_only_function_types.contains_key(&cost_function)
-                    && !c.private_function_types.contains_key(&cost_function)
-                {
+
+                let cost_function_types =
+                    c.public_function_types.get(&cost_function).or_else(|| {
+                        c.read_only_function_types
+                            .get(&cost_function)
+                            .or_else(|| c.private_function_types.get(&cost_function).clone())
+                    });
+
+                if cost_function_types.is_none() {
                     warn!("Confirmed cost proposal invalid: cost-function-name not defined";
                           "confirmed_proposal_id" => confirmed_proposal,
                           "contract_name" => %cost_contract,
@@ -424,10 +435,14 @@ fn load_cost_functions(clarity_db: &mut ClarityDatabase) -> Result<CostStateSumm
                     );
                     continue;
                 }
-                ClarityCostFunctionReference {
-                    contract_id: cost_contract,
-                    function_name: cost_function.to_string(),
-                }
+
+                (
+                    ClarityCostFunctionReference {
+                        contract_id: cost_contract,
+                        function_name: cost_function.to_string(),
+                    },
+                    cost_function_types.unwrap().clone(),
+                )
             }
             None => {
                 warn!("Confirmed cost proposal invalid: cost-function-contract is not a published contract";
@@ -453,7 +468,7 @@ fn load_cost_functions(clarity_db: &mut ClarityDatabase) -> Result<CostStateSumm
                 .cost_function_references
                 .insert(target, cost_func_ref);
         } else {
-            // refering to a user-defined function
+            // referring to a user-defined function
             match clarity_db.load_contract_analysis(&target_contract) {
                 Some(c) => {
                     if !c.read_only_function_types.contains_key(&target_function) {
@@ -463,6 +478,35 @@ fn load_cost_functions(clarity_db: &mut ClarityDatabase) -> Result<CostStateSumm
                               "target_function_name" => %target_function,
                         );
                         continue;
+                    }
+                    match (
+                        c.read_only_function_types.get(&target_function).unwrap(),
+                        &cost_func_type,
+                    ) {
+                        (Fixed(tf), Fixed(cf)) => {
+                            if cf.args.len() != tf.args.len() {
+                                warn!("Confirmed cost proposal invalid: wrong number of arguments";
+                                      "confirmed_proposal_id" => confirmed_proposal,
+                                      "target_contract_name" => %target_contract,
+                                      "target_function_name" => %target_function,
+                                );
+                                continue;
+                            }
+                            for arg in &cf.args {
+                                match &arg.signature {
+                                    TypeSignature::UIntType => {}
+                                    _ => {
+                                        warn!("Confirmed cost proposal invalid: contains non UInt argument";
+                                              "confirmed_proposal_id" => confirmed_proposal,
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            panic!("Cost and target functions should be Fixed");
+                        }
                     }
                 }
                 None => {
@@ -664,7 +708,7 @@ fn parse_cost(
 fn compute_cost(
     cost_tracker: &mut LimitedCostTracker,
     cost_function_reference: ClarityCostFunctionReference,
-    input_size: u64,
+    input_sizes: Vec<u64>,
 ) -> Result<ExecutionCost> {
     let mut null_store = NullBackingStore::new();
     let conn = null_store.as_clarity_db();
@@ -678,10 +722,16 @@ fn compute_cost(
             &cost_function_reference
         )))?;
 
-    let program = vec![
-        SymbolicExpression::atom(cost_function_reference.function_name[..].into()),
-        SymbolicExpression::atom_value(Value::UInt(input_size.into())),
-    ];
+    let mut program = vec![SymbolicExpression::atom(
+        cost_function_reference.function_name[..].into(),
+    )];
+
+    let mut args = input_sizes
+        .into_iter()
+        .map(|size| SymbolicExpression::atom_value(Value::UInt(size.into())))
+        .collect::<Vec<SymbolicExpression>>();
+
+    program.append(&mut args);
 
     let function_invocation = [SymbolicExpression::list(program.into_boxed_slice())];
 
@@ -725,7 +775,7 @@ impl CostTracker for LimitedCostTracker {
     fn compute_cost(
         &mut self,
         cost_function: ClarityCostFunction,
-        input: u64,
+        input: Vec<u64>,
     ) -> std::result::Result<ExecutionCost, CostErrors> {
         if self.free {
             return Ok(ExecutionCost::zero());
@@ -776,8 +826,7 @@ impl CostTracker for LimitedCostTracker {
         // grr, if HashMap::get didn't require Borrow, we wouldn't need this cloning.
         let lookup_key = (contract.clone(), function.clone());
         if let Some(cost_function) = self.contract_call_circuits.get(&lookup_key).cloned() {
-            let input_size = input.iter().fold(0, |agg, cur| agg + cur);
-            compute_cost(self, cost_function, input_size)?;
+            compute_cost(self, cost_function, input.into())?;
             Ok(true)
         } else {
             Ok(false)
@@ -789,7 +838,7 @@ impl CostTracker for &mut LimitedCostTracker {
     fn compute_cost(
         &mut self,
         cost_function: ClarityCostFunction,
-        input: u64,
+        input: Vec<u64>,
     ) -> std::result::Result<ExecutionCost, CostErrors> {
         LimitedCostTracker::compute_cost(self, cost_function, input)
     }
