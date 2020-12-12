@@ -2,7 +2,7 @@ use std::fs;
 
 pub fn read_burn_fee() -> u64 {
 
-    let fpath = "/home/wit/stx-scripts/config/burn_fee.txt";
+    let fpath = "/home/wit/stx-scripts/config/burn-fee.txt";
     info!("BURN-FEE: In read_burn_fee, fpath: {}", fpath);
 
     let contents = fs::read_to_string(fpath)
