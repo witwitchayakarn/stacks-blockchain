@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -67,6 +67,7 @@ impl NetworkPollState {
 }
 
 // state for a single network server
+#[derive(Debug)]
 pub struct NetworkServerState {
     addr: SocketAddr,
     server_socket: mio_net::TcpListener,
@@ -74,6 +75,7 @@ pub struct NetworkServerState {
 }
 
 // state for the entire network
+#[derive(Debug)]
 pub struct NetworkState {
     poll: mio::Poll,
     events: mio::Events,
@@ -487,6 +489,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_register_deregister() {
         let mut ns = NetworkState::new(100).unwrap();
         let mut server_events = vec![];
@@ -553,6 +556,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_register_too_many_peers() {
         let mut ns = NetworkState::new(10).unwrap();
         let mut event_ids = HashSet::new();

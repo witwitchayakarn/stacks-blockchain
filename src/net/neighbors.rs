@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -196,7 +196,7 @@ impl Neighbor {
 /// -- reports neighbors we had trouble talking to.
 /// The peer network will use this struct to clean out dead neighbors, and to keep the number of
 /// _outgoing_ connections limited to NUM_NEIGHBORS.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NeighborWalkResult {
     pub new_connections: HashSet<NeighborKey>,
     pub dead_connections: HashSet<NeighborKey>,
@@ -258,6 +258,7 @@ pub enum NeighborWalkState {
     Finished,
 }
 
+#[derive(Debug)]
 pub struct NeighborWalk {
     pub state: NeighborWalkState,
     pub events: HashSet<usize>,

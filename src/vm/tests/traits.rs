@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -981,7 +981,7 @@ fn test_return_trait_with_contract_of_wrapped_in_begin(owned_env: &mut OwnedEnvi
             (get-1 (uint) (response uint uint))))
         (define-public (wrapped-get-1 (contract <trait-1>))
             (begin
-                (contract-call? contract get-1 u0)
+                (unwrap-panic (contract-call? contract get-1 u0))
                 (ok (contract-of contract))))";
     let target_contract = "(define-public (get-1 (x uint)) (ok u1))";
 
@@ -1024,7 +1024,7 @@ fn test_return_trait_with_contract_of_wrapped_in_let(owned_env: &mut OwnedEnviro
             (get-1 (uint) (response uint uint))))
         (define-public (wrapped-get-1 (contract <trait-1>))
             (let ((val u0))
-                (contract-call? contract get-1 val)
+                (unwrap-panic (contract-call? contract get-1 val))
                 (ok (contract-of contract))))";
     let target_contract = "(define-public (get-1 (x uint)) (ok u1))";
 

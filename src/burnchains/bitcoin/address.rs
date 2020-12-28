@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -120,7 +120,7 @@ impl BitcoinAddress {
     pub fn from_bytes(
         network_id: BitcoinNetworkType,
         addrtype: BitcoinAddressType,
-        bytes: &Vec<u8>,
+        bytes: &[u8],
     ) -> Result<BitcoinAddress, btc_error> {
         if bytes.len() != 20 {
             return Err(btc_error::InvalidByteSequence);

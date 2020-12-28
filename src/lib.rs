@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -67,13 +67,15 @@ pub mod util;
 pub mod net;
 
 #[macro_use]
+pub mod vm;
+
+#[macro_use]
 pub mod chainstate;
 
 pub mod address;
 pub mod burnchains;
 pub mod core;
 pub mod deps;
-pub mod vm;
 
 pub mod clarity;
 

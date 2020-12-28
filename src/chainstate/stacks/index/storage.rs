@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -719,6 +719,10 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         &self.db
     }
 
+    pub fn sqlite_tx<'a>(&'a mut self) -> Result<Transaction<'a>, db_error> {
+        tx_begin_immediate(&mut self.db)
+    }
+
     fn open_opts(
         db_path: &str,
         readonly: bool,
@@ -923,9 +927,6 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         // Runs once -- subsequent calls are no-ops.
         // Panics on a failure to rename the Trie file into place (i.e. if the the actual commitment
         // fails).
-        // TODO: this needs to be more robust.  Also fsync the parent directory itself, before and
-        // after.  Turns out rename(2) isn't crash-consistent, and turns out syscalls can get
-        // reordered.
         self.clear_cached_ancestor_hashes_bytes();
         if self.data.readonly {
             return Err(Error::ReadOnlyError);
@@ -1141,10 +1142,34 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         }
     }
 
+    pub fn sqlite_tx_mut(&mut self) -> &mut Transaction<'a> {
+        match &mut self.0.db {
+            SqliteConnection::Tx(ref mut tx) => tx,
+            SqliteConnection::ConnRef(_) => {
+                unreachable!(
+                    "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
+                );
+            }
+        }
+    }
+
     pub fn commit_tx(self) {
         match self.0.db {
             SqliteConnection::Tx(tx) => {
                 tx.commit().expect("CORRUPTION: Failed to commit MARF");
+            }
+            SqliteConnection::ConnRef(_) => {
+                unreachable!(
+                    "BUG: Constructed TrieStorageTransaction with a bare sqlite connection ref."
+                );
+            }
+        }
+    }
+
+    pub fn rollback(self) {
+        match self.0.db {
+            SqliteConnection::Tx(tx) => {
+                tx.rollback().expect("CORRUPTION: Failed to commit MARF");
             }
             SqliteConnection::ConnRef(_) => {
                 unreachable!(

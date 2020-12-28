@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -520,10 +520,12 @@ impl BitcoinTxInput {
 }
 
 fn to_txid(txin: &BtcTxIn) -> (Txid, u32) {
-    (
-        Txid(txin.previous_output.txid.0.clone()),
-        txin.previous_output.vout,
-    )
+    // bitcoin-rs library (which deps::bitcoin is based on)
+    //   operates in a different endian-ness for txids than the rest of
+    //   the codebase. so this method reverses the txid bits.
+    let mut bits = txin.previous_output.txid.0.clone();
+    bits.reverse();
+    (Txid(bits), txin.previous_output.vout)
 }
 
 impl BitcoinTxOutput {

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -107,7 +107,9 @@ fn read_next_vec<T: StacksMessageCodec + Sized, R: Read>(
 
     if (mem::size_of::<T>() as u128) * (len as u128) > MAX_MESSAGE_LEN as u128 {
         return Err(net_error::DeserializeError(format!(
-            "Message occupies too many bytes (tried to allocate {})",
+            "Message occupies too many bytes (tried to allocate {}*{}={})",
+            mem::size_of::<T>() as u128,
+            len,
             (mem::size_of::<T>() as u128) * (len as u128)
         )));
     }

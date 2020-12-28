@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,13 +15,16 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use chainstate::burn::BlockHeaderHash;
-use chainstate::stacks::db::{blocks::MemPoolRejection, ClarityTx, StacksChainState};
+use chainstate::stacks::db::{
+    blocks::MemPoolRejection, ClarityTx, StacksChainState, MINER_REWARD_MATURITY,
+};
 use chainstate::stacks::events::StacksTransactionReceipt;
 use chainstate::stacks::index::TrieHash;
 use chainstate::stacks::Error;
 use chainstate::stacks::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::convert::From;
 use std::fs;
 use std::mem;
 
@@ -40,6 +43,8 @@ use chainstate::burn::db::sortdb::{SortitionDB, SortitionDBConn};
 use chainstate::burn::operations::*;
 use chainstate::burn::*;
 
+use chainstate::stacks::db::unconfirmed::UnconfirmedState;
+
 use burnchains::BurnchainHeaderHash;
 use burnchains::PrivateKey;
 use burnchains::PublicKey;
@@ -50,6 +55,30 @@ use core::mempool::*;
 use core::*;
 
 use vm::database::{BurnStateDB, NULL_BURN_STATE_DB};
+
+#[derive(Clone)]
+struct MicroblockMinerRuntime {
+    consumed_execution: ExecutionCost,
+    bytes_so_far: u64,
+    pub prev_microblock_header: Option<StacksMicroblockHeader>,
+    considered: Option<HashSet<Txid>>,
+}
+
+impl From<&UnconfirmedState> for MicroblockMinerRuntime {
+    fn from(unconfirmed: &UnconfirmedState) -> MicroblockMinerRuntime {
+        let considered = unconfirmed
+            .mined_txs
+            .iter()
+            .map(|(txid, _)| txid.clone())
+            .collect();
+        MicroblockMinerRuntime {
+            consumed_execution: unconfirmed.cost_so_far.clone(),
+            bytes_so_far: unconfirmed.bytes_so_far,
+            prev_microblock_header: unconfirmed.last_mblock.clone(),
+            considered: Some(considered),
+        }
+    }
+}
 
 ///
 ///    Independent structure for building microblocks:
@@ -64,11 +93,10 @@ pub struct StacksMicroblockBuilder<'a> {
     anchor_block: BlockHeaderHash,
     anchor_block_consensus_hash: ConsensusHash,
     anchor_block_height: u64,
-    prev_microblock_header: Option<StacksMicroblockHeader>,
     header_reader: StacksChainState,
     clarity_tx: Option<ClarityTx<'a>>,
-    considered: Option<HashSet<Txid>>,
-    bytes_so_far: u64,
+    unconfirmed: bool,
+    runtime: MicroblockMinerRuntime,
 }
 
 impl<'a> StacksMicroblockBuilder<'a> {
@@ -77,17 +105,31 @@ impl<'a> StacksMicroblockBuilder<'a> {
         anchor_block_consensus_hash: ConsensusHash,
         chainstate: &'a mut StacksChainState,
         burn_dbconn: &'a dyn BurnStateDB,
-        initial_cost: ExecutionCost,
-        bytes_so_far: u64,
     ) -> Result<StacksMicroblockBuilder<'a>, Error> {
+        let runtime = if let Some(unconfirmed_state) = chainstate.unconfirmed_state.as_ref() {
+            MicroblockMinerRuntime::from(unconfirmed_state)
+        } else {
+            warn!("No unconfirmed state instantiated; cannot mine microblocks");
+            return Err(Error::NoSuchBlockError);
+        };
+
         let (header_reader, _) = chainstate.reopen()?;
         let anchor_block_height = StacksChainState::get_anchored_block_header_info(
-            header_reader.headers_db(),
+            header_reader.db(),
             &anchor_block_consensus_hash,
             &anchor_block,
         )?
-        .ok_or(Error::NoSuchBlockError)?
+        .ok_or_else(|| {
+            warn!(
+                "No such block: {}/{}",
+                &anchor_block_consensus_hash, &anchor_block
+            );
+            Error::NoSuchBlockError
+        })?
         .block_height;
+
+        // when we drop the miner, the underlying clarity instance will be rolled back
+        chainstate.set_unconfirmed_dirty(true);
 
         // We need to open the chainstate _after_ any possible errors could occur, otherwise, we'd have opened
         //  the chainstate, but will lose the reference to the clarity_tx before the Drop handler for StacksMicroblockBuilder
@@ -100,39 +142,96 @@ impl<'a> StacksMicroblockBuilder<'a> {
             &MINER_BLOCK_HEADER_HASH,
         );
 
-        clarity_tx.reset_cost(initial_cost);
+        clarity_tx.reset_cost(runtime.consumed_execution.clone());
+
         Ok(StacksMicroblockBuilder {
             anchor_block,
             anchor_block_consensus_hash,
             anchor_block_height,
-            bytes_so_far,
+            runtime: runtime,
             clarity_tx: Some(clarity_tx),
             header_reader,
-            prev_microblock_header: None,
-            considered: Some(HashSet::new()),
+            unconfirmed: false,
+        })
+    }
+
+    /// Create a microblock miner off of the _unconfirmed_ chaintip, i.e., resuming construction of
+    /// a microblock stream.
+    pub fn resume_unconfirmed(
+        chainstate: &'a mut StacksChainState,
+        burn_dbconn: &'a dyn BurnStateDB,
+    ) -> Result<StacksMicroblockBuilder<'a>, Error> {
+        let runtime = if let Some(unconfirmed_state) = chainstate.unconfirmed_state.as_ref() {
+            MicroblockMinerRuntime::from(unconfirmed_state)
+        } else {
+            warn!("No unconfirmed state instantiated; cannot mine microblocks");
+            return Err(Error::NoSuchBlockError);
+        };
+
+        let (header_reader, _) = chainstate.reopen()?;
+        let (anchored_consensus_hash, anchored_block_hash, anchored_block_height) =
+            if let Some(unconfirmed) = chainstate.unconfirmed_state.as_ref() {
+                let header_info =
+                    StacksChainState::get_stacks_block_header_info_by_index_block_hash(
+                        chainstate.db(),
+                        &unconfirmed.confirmed_chain_tip,
+                    )?
+                    .ok_or_else(|| {
+                        warn!(
+                            "No such confirmed block {}",
+                            &unconfirmed.confirmed_chain_tip
+                        );
+                        Error::NoSuchBlockError
+                    })?;
+                (
+                    header_info.consensus_hash,
+                    header_info.anchored_header.block_hash(),
+                    header_info.block_height,
+                )
+            } else {
+                // unconfirmed state needs to be initialized
+                debug!("Unconfirmed chainstate not initialized");
+                return Err(Error::NoSuchBlockError)?;
+            };
+
+        let mut clarity_tx = chainstate.begin_unconfirmed(burn_dbconn).ok_or_else(|| {
+            warn!(
+                "Failed to begin-unconfirmed on {}/{}",
+                &anchored_consensus_hash, &anchored_block_hash
+            );
+            Error::NoSuchBlockError
+        })?;
+
+        clarity_tx.reset_cost(runtime.consumed_execution.clone());
+
+        Ok(StacksMicroblockBuilder {
+            anchor_block: anchored_block_hash,
+            anchor_block_consensus_hash: anchored_consensus_hash,
+            anchor_block_height: anchored_block_height,
+            runtime: runtime,
+            clarity_tx: Some(clarity_tx),
+            header_reader,
+            unconfirmed: true,
         })
     }
 
     fn make_next_microblock(
         &mut self,
-        txs_to_broadcast: Vec<StacksTransaction>,
+        txs: Vec<StacksTransaction>,
         miner_key: &Secp256k1PrivateKey,
     ) -> Result<StacksMicroblock, Error> {
         let miner_pubkey_hash =
             Hash160::from_node_public_key(&StacksPublicKey::from_private(miner_key));
-        if txs_to_broadcast.len() == 0 {
+        if txs.len() == 0 {
             return Err(Error::NoTransactionsToMine);
         }
 
-        let txid_vecs = txs_to_broadcast
-            .iter()
-            .map(|tx| tx.txid().as_bytes().to_vec())
-            .collect();
+        let txid_vecs = txs.iter().map(|tx| tx.txid().as_bytes().to_vec()).collect();
 
         let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&txid_vecs);
         let tx_merkle_root = merkle_tree.root();
         let mut next_microblock_header =
-            if let Some(ref prev_microblock) = self.prev_microblock_header {
+            if let Some(ref prev_microblock) = self.runtime.prev_microblock_header {
                 StacksMicroblockHeader::from_parent_unsigned(prev_microblock, &tx_merkle_root)
                     .ok_or(Error::MicroblockStreamTooLongError)?
             } else {
@@ -143,67 +242,73 @@ impl<'a> StacksMicroblockBuilder<'a> {
         next_microblock_header.sign(miner_key).unwrap();
         next_microblock_header.verify(&miner_pubkey_hash).unwrap();
 
-        self.prev_microblock_header = Some(next_microblock_header.clone());
+        self.runtime.prev_microblock_header = Some(next_microblock_header.clone());
 
         let microblock = StacksMicroblock {
             header: next_microblock_header,
-            txs: txs_to_broadcast,
+            txs: txs,
         };
 
         debug!(
-            "\n\nMiner: Mined microblock block {} (seq={}): {} transaction(s)\n",
+            "\n\nMiner: Created microblock block {} (seq={}) off of {}/{}: {} transaction(s)\n",
             microblock.block_hash(),
             microblock.header.sequence,
+            self.anchor_block_consensus_hash,
+            self.anchor_block,
             microblock.txs.len()
         );
         Ok(microblock)
     }
 
+    /// Mine the next transaction into a microblock.
+    /// Returns true/false if the transaction was/was not mined into this microblock.
     fn mine_next_transaction(
         clarity_tx: &mut ClarityTx<'a>,
-        mempool_tx: MemPoolTxInfo,
+        tx: StacksTransaction,
+        tx_len: u64,
         considered: &mut HashSet<Txid>,
         bytes_so_far: u64,
-    ) -> Result<Option<(StacksTransaction, u64)>, Error> {
-        if mempool_tx.tx.anchor_mode != TransactionAnchorMode::OffChainOnly
-            && mempool_tx.tx.anchor_mode != TransactionAnchorMode::Any
+    ) -> Result<bool, Error> {
+        if tx.anchor_mode != TransactionAnchorMode::OffChainOnly
+            && tx.anchor_mode != TransactionAnchorMode::Any
         {
-            return Ok(None);
+            return Ok(false);
         }
-        if considered.contains(&mempool_tx.metadata.txid) {
-            return Ok(None);
+        if considered.contains(&tx.txid()) {
+            return Ok(false);
         } else {
-            considered.insert(mempool_tx.metadata.txid.clone());
+            considered.insert(tx.txid());
         }
-        if bytes_so_far + mempool_tx.metadata.len >= MAX_EPOCH_SIZE.into() {
+        if bytes_so_far + tx_len >= MAX_EPOCH_SIZE.into() {
             return Err(Error::BlockTooBigError);
         }
-        match StacksChainState::process_transaction(clarity_tx, &mempool_tx.tx, true) {
-            Ok(_) => return Ok(Some((mempool_tx.tx, mempool_tx.metadata.len))),
+        let quiet = !cfg!(test);
+        match StacksChainState::process_transaction(clarity_tx, &tx, quiet) {
+            Ok(_) => return Ok(true),
             Err(e) => match e {
                 Error::CostOverflowError(cost_before, cost_after, total_budget) => {
                     warn!(
                         "Transaction {} reached block cost {}; budget was {}",
-                        mempool_tx.tx.txid(),
+                        tx.txid(),
                         &cost_after,
                         &total_budget
                     );
                     clarity_tx.reset_cost(cost_before.clone());
                 }
                 _ => {
-                    warn!("Error processing TX {}: {}", mempool_tx.tx.txid(), e);
+                    warn!("Error processing TX {}: {}", tx.txid(), e);
                 }
             },
         }
-        return Ok(None);
+        return Ok(false);
     }
 
     pub fn mine_next_microblock_from_txs(
         &mut self,
-        txs: Vec<MemPoolTxInfo>,
+        txs_and_lens: Vec<(StacksTransaction, u64)>,
         miner_key: &Secp256k1PrivateKey,
     ) -> Result<StacksMicroblock, Error> {
-        let mut txs_to_broadcast = vec![];
+        let mut txs_included = vec![];
 
         let mut clarity_tx = self
             .clarity_tx
@@ -211,25 +316,27 @@ impl<'a> StacksMicroblockBuilder<'a> {
             .expect("Microblock already open and processing");
 
         let mut considered = self
+            .runtime
             .considered
             .take()
             .expect("Microblock already open and processing");
 
-        let mut bytes_so_far = self.bytes_so_far;
+        let mut bytes_so_far = self.runtime.bytes_so_far;
 
         let mut result = Ok(());
-        for mempool_tx in txs.into_iter() {
+        for (tx, tx_len) in txs_and_lens.into_iter() {
             match StacksMicroblockBuilder::mine_next_transaction(
                 &mut clarity_tx,
-                mempool_tx,
+                tx.clone(),
+                tx_len,
                 &mut considered,
                 bytes_so_far,
             ) {
-                Ok(Some((tx, tx_len))) => {
+                Ok(true) => {
                     bytes_so_far += tx_len;
-                    txs_to_broadcast.push(tx);
+                    txs_included.push(tx);
                 }
-                Ok(None) => {
+                Ok(false) => {
                     continue;
                 }
                 Err(e) => {
@@ -239,9 +346,9 @@ impl<'a> StacksMicroblockBuilder<'a> {
             }
         }
 
-        self.bytes_so_far = bytes_so_far;
+        self.runtime.bytes_so_far = bytes_so_far;
         self.clarity_tx.replace(clarity_tx);
-        self.considered.replace(considered);
+        self.runtime.considered.replace(considered);
 
         match result {
             Err(Error::BlockTooBigError) => {
@@ -254,7 +361,7 @@ impl<'a> StacksMicroblockBuilder<'a> {
             _ => {}
         }
 
-        return self.make_next_microblock(txs_to_broadcast, miner_key);
+        return self.make_next_microblock(txs_included, miner_key);
     }
 
     pub fn mine_next_microblock(
@@ -262,7 +369,7 @@ impl<'a> StacksMicroblockBuilder<'a> {
         mem_pool: &MemPoolDB,
         miner_key: &Secp256k1PrivateKey,
     ) -> Result<StacksMicroblock, Error> {
-        let mut txs_to_broadcast = vec![];
+        let mut txs_included = vec![];
 
         let mut clarity_tx = self
             .clarity_tx
@@ -270,11 +377,12 @@ impl<'a> StacksMicroblockBuilder<'a> {
             .expect("Microblock already open and processing");
 
         let mut considered = self
+            .runtime
             .considered
             .take()
             .expect("Microblock already open and processing");
 
-        let mut bytes_so_far = self.bytes_so_far;
+        let mut bytes_so_far = self.runtime.bytes_so_far;
 
         let result = mem_pool.iterate_candidates(
             &self.anchor_block_consensus_hash,
@@ -286,15 +394,16 @@ impl<'a> StacksMicroblockBuilder<'a> {
                 for mempool_tx in micro_txs.into_iter() {
                     match StacksMicroblockBuilder::mine_next_transaction(
                         &mut clarity_tx,
-                        mempool_tx,
+                        mempool_tx.tx.clone(),
+                        mempool_tx.metadata.len,
                         &mut considered,
                         bytes_so_far,
                     ) {
-                        Ok(Some((tx, tx_len))) => {
-                            bytes_so_far += tx_len;
-                            txs_to_broadcast.push(tx);
+                        Ok(true) => {
+                            bytes_so_far += mempool_tx.metadata.len;
+                            txs_included.push(mempool_tx.tx);
                         }
-                        Ok(None) => {
+                        Ok(false) => {
                             continue;
                         }
                         Err(e) => {
@@ -307,9 +416,9 @@ impl<'a> StacksMicroblockBuilder<'a> {
             },
         );
 
-        self.bytes_so_far = bytes_so_far;
+        self.runtime.bytes_so_far = bytes_so_far;
         self.clarity_tx.replace(clarity_tx);
-        self.considered.replace(considered);
+        self.runtime.considered.replace(considered);
 
         match result {
             Ok(_) => {}
@@ -322,7 +431,15 @@ impl<'a> StacksMicroblockBuilder<'a> {
             }
         }
 
-        return self.make_next_microblock(txs_to_broadcast, miner_key);
+        return self.make_next_microblock(txs_included, miner_key);
+    }
+
+    pub fn get_bytes_so_far(&self) -> u64 {
+        self.runtime.bytes_so_far
+    }
+
+    pub fn get_cost_so_far(&self) -> Option<ExecutionCost> {
+        self.clarity_tx.as_ref().map(|tx| tx.cost_so_far())
     }
 }
 
@@ -368,6 +485,10 @@ impl StacksBlockBuilder {
             total_streamed_fees: 0,
             bytes_so_far: bytes_so_far,
             anchored_done: false,
+            parent_microblock_hash: parent_chain_tip
+                .microblock_tail
+                .as_ref()
+                .map(|ref hdr| hdr.block_hash()),
             prev_microblock_header: StacksMicroblockHeader::first_unsigned(
                 &EMPTY_MICROBLOCK_PARENT_HASH,
                 &Sha512Trunc256Sum([0u8; 32]),
@@ -419,6 +540,7 @@ impl StacksBlockBuilder {
             burn_header_timestamp: genesis_burn_header_timestamp,
             burn_header_height: genesis_burn_header_height,
             total_liquid_ustx: 0,
+            anchored_block_size: 0,
         };
 
         let mut builder = StacksBlockBuilder::from_parent_pubkey_hash(
@@ -473,6 +595,17 @@ impl StacksBlockBuilder {
         self.header.parent_microblock_sequence = parent_mblock_seq;
     }
 
+    /// Set the block header's public key hash
+    pub fn set_microblock_pubkey_hash(&mut self, pubkh: Hash160) -> bool {
+        if self.anchored_done {
+            // too late
+            return false;
+        }
+
+        self.header.microblock_pubkey_hash = pubkh;
+        return true;
+    }
+
     /// Reset measured costs and fees
     pub fn reset_costs(&mut self) -> () {
         self.total_anchored_fees = 0;
@@ -503,6 +636,7 @@ impl StacksBlockBuilder {
             return Err(Error::BlockTooBigError);
         }
 
+        let quiet = !cfg!(test);
         if !self.anchored_done {
             // building up the anchored blocks
             if tx.anchor_mode != TransactionAnchorMode::OnChainOnly
@@ -514,7 +648,7 @@ impl StacksBlockBuilder {
                 ));
             }
 
-            let (fee, _receipt) = StacksChainState::process_transaction(clarity_tx, tx, true)
+            let (fee, _receipt) = StacksChainState::process_transaction(clarity_tx, tx, quiet)
                 .map_err(|e| match e {
                     Error::CostOverflowError(cost_before, cost_after, total_budget) => {
                         warn!(
@@ -545,7 +679,7 @@ impl StacksBlockBuilder {
                 ));
             }
 
-            let (fee, _receipt) = StacksChainState::process_transaction(clarity_tx, tx, true)
+            let (fee, _receipt) = StacksChainState::process_transaction(clarity_tx, tx, quiet)
                 .map_err(|e| match e {
                     Error::CostOverflowError(cost_before, cost_after, total_budget) => {
                         warn!(
@@ -590,9 +724,10 @@ impl StacksBlockBuilder {
             );
         }
 
+        let quiet = !cfg!(test);
         if !self.anchored_done {
             // save
-            match StacksChainState::process_transaction(clarity_tx, tx, true) {
+            match StacksChainState::process_transaction(clarity_tx, tx, quiet) {
                 Ok((fee, receipt)) => {
                     self.total_anchored_fees += fee;
                 }
@@ -603,7 +738,7 @@ impl StacksBlockBuilder {
 
             self.txs.push(tx.clone());
         } else {
-            match StacksChainState::process_transaction(clarity_tx, tx, true) {
+            match StacksChainState::process_transaction(clarity_tx, tx, quiet) {
                 Ok((fee, receipt)) => {
                     self.total_streamed_fees += fee;
                 }
@@ -630,12 +765,29 @@ impl StacksBlockBuilder {
         assert!(!self.anchored_done);
 
         // add miner payments
-        if let Some(ref mature_miner_rewards) = self.miner_payouts {
+        if let Some((ref miner_reward, ref user_rewards, ref parent_reward)) = self.miner_payouts {
             // grant in order by miner, then users
-            StacksChainState::process_matured_miner_rewards(clarity_tx, mature_miner_rewards)
-                .expect("FATAL: failed to process miner rewards");
+            StacksChainState::process_matured_miner_rewards(
+                clarity_tx,
+                miner_reward,
+                user_rewards,
+                parent_reward,
+            )
+            .expect("FATAL: failed to process miner rewards");
         }
 
+        // process unlocks
+        StacksChainState::process_stx_unlocks(clarity_tx).expect("FATAL: failed to unlock STX");
+
+        // mark microblock public key as used
+        StacksChainState::insert_microblock_pubkey_hash(
+            clarity_tx,
+            self.header.total_work.work as u32,
+            &self.header.microblock_pubkey_hash,
+        )
+        .expect("FATAL: failed to insert microblock pubkey hash");
+
+        // done!  Calculate state root and tx merkle root
         let txid_vecs = self
             .txs
             .iter()
@@ -741,14 +893,17 @@ impl StacksBlockBuilder {
         chainstate: &'a mut StacksChainState,
         burn_dbconn: &'a SortitionDBConn,
     ) -> Result<ClarityTx<'a>, Error> {
-        // find matured miner rewards, so we can grant them within the Clarity DB tx.
-        let matured_miner_rewards_opt = {
-            let mut tx = chainstate.headers_tx_begin()?;
-            StacksChainState::find_mature_miner_rewards(&mut tx, &self.chain_tip, None)?
-                .map(|(rewards, _)| rewards)
-        };
+        let mainnet = chainstate.config().mainnet;
 
-        self.miner_payouts = matured_miner_rewards_opt;
+        // find matured miner rewards, so we can grant them within the Clarity DB tx.
+        let (latest_matured_miners, matured_miner_parent) = {
+            let mut tx = chainstate.index_tx_begin()?;
+            let latest_miners =
+                StacksChainState::get_scheduled_block_rewards(&mut tx, &self.chain_tip)?;
+            let parent_miner =
+                StacksChainState::get_parent_matured_miner(&mut tx, mainnet, &latest_miners)?;
+            (latest_miners, parent_miner)
+        };
 
         // there's no way the miner can learn either the burn block hash or the stacks block hash,
         // so use a sentinel hash value for each that will never occur in practice.
@@ -762,27 +917,58 @@ impl StacksBlockBuilder {
                                     self.header.parent_block)
         );
 
-        if let Some(ref _payout) = self.miner_payouts {
-            test_debug!("Miner payout to process: {:?}", _payout);
+        if let Some((ref _miner_payout, ref _user_payouts, ref _parent_reward)) = self.miner_payouts
+        {
+            test_debug!(
+                "Miner payout to process: {:?}; user payouts: {:?}; parent payout: {:?}",
+                _miner_payout,
+                _user_payouts,
+                _parent_reward
+            );
         }
 
         let parent_consensus_hash = self.chain_tip.consensus_hash.clone();
         let parent_header_hash = self.header.parent_block.clone();
+        let parent_index_hash =
+            StacksBlockHeader::make_index_block_hash(&parent_consensus_hash, &parent_header_hash);
 
-        // apply all known parent microblocks before beginning our tenure
-        let parent_microblocks = match StacksChainState::load_staging_microblock_stream(
-            &chainstate.blocks_db,
-            &chainstate.blocks_path,
+        let parent_microblocks =
+            if let Some(microblock_parent_hash) = self.parent_microblock_hash.as_ref() {
+                // load up a microblock fork
+                let microblocks = StacksChainState::load_microblock_stream_fork(
+                    &chainstate.db(),
+                    &parent_consensus_hash,
+                    &parent_header_hash,
+                    &microblock_parent_hash,
+                )?
+                .ok_or(Error::NoSuchBlockError)?;
+
+                microblocks
+            } else {
+                // apply all known parent microblocks before beginning our tenure
+                let (parent_microblocks, _) =
+                    match StacksChainState::load_descendant_staging_microblock_stream_with_poison(
+                        &chainstate.db(),
+                        &parent_index_hash,
+                        0,
+                        u16::MAX,
+                    )? {
+                        Some(x) => x,
+                        None => (vec![], None),
+                    };
+                parent_microblocks
+            };
+
+        debug!(
+            "Descendant of {}/{} confirms {} microblock(s)",
             &parent_consensus_hash,
             &parent_header_hash,
-            u16::max_value(),
-        )? {
-            Some(mblocks) => mblocks,
-            None => vec![],
-        };
+            parent_microblocks.len()
+        );
 
         let burn_tip = SortitionDB::get_canonical_chain_tip_bhh(burn_dbconn.conn())?;
         let stacking_burn_ops = SortitionDB::get_stack_stx_ops(burn_dbconn.conn(), &burn_tip)?;
+        let transfer_burn_ops = SortitionDB::get_transfer_stx_ops(burn_dbconn.conn(), &burn_tip)?;
 
         let mut tx = chainstate.block_begin(
             burn_dbconn,
@@ -791,6 +977,16 @@ impl StacksBlockBuilder {
             &new_consensus_hash,
             &new_block_hash,
         );
+
+        let matured_miner_rewards_opt = StacksChainState::find_mature_miner_rewards(
+            &mut tx,
+            &self.chain_tip,
+            latest_matured_miners,
+            matured_miner_parent,
+        )?;
+
+        self.miner_payouts =
+            matured_miner_rewards_opt.map(|(miner, users, parent, _)| (miner, users, parent));
 
         test_debug!(
             "Miner {}: Apply {} parent microblocks",
@@ -818,7 +1014,7 @@ impl StacksBlockBuilder {
             let num_mblocks = parent_microblocks.len();
             let last_mblock_hdr = parent_microblocks[num_mblocks - 1].header.clone();
             self.set_parent_microblock(&last_mblock_hdr.block_hash(), last_mblock_hdr.sequence);
-        };
+        }
 
         test_debug!(
             "Miner {}: Finished applying {} parent microblocks\n",
@@ -827,6 +1023,7 @@ impl StacksBlockBuilder {
         );
 
         StacksChainState::process_stacking_ops(&mut tx, stacking_burn_ops);
+        StacksChainState::process_transfer_ops(&mut tx, transfer_burn_ops);
 
         Ok(tx)
     }
@@ -1102,11 +1299,13 @@ pub mod test {
 
     use util::sleep_ms;
 
+    use std::cell::RefCell;
+
     pub const COINBASE: u128 = 500 * 1_000_000;
 
     pub fn coinbase_total_at(stacks_height: u64) -> u128 {
-        if stacks_height > MINER_REWARD_MATURITY + MINER_REWARD_WINDOW {
-            COINBASE * ((stacks_height - MINER_REWARD_MATURITY - MINER_REWARD_WINDOW) as u128)
+        if stacks_height > MINER_REWARD_MATURITY {
+            COINBASE * ((stacks_height - MINER_REWARD_MATURITY) as u128)
         } else {
             0
         }
@@ -1319,8 +1518,23 @@ pub mod test {
     }
 
     impl TestStacksNode {
-        pub fn new(mainnet: bool, chain_id: u32, test_name: &str) -> TestStacksNode {
-            let chainstate = instantiate_chainstate(mainnet, chain_id, test_name);
+        pub fn new(
+            mainnet: bool,
+            chain_id: u32,
+            test_name: &str,
+            mut initial_balance_recipients: Vec<StacksAddress>,
+        ) -> TestStacksNode {
+            initial_balance_recipients.sort();
+            let initial_balances = initial_balance_recipients
+                .into_iter()
+                .map(|addr| (addr, 10_000_000_000))
+                .collect();
+            let chainstate = instantiate_chainstate_with_balances(
+                mainnet,
+                chain_id,
+                test_name,
+                initial_balances,
+            );
             TestStacksNode {
                 chainstate: chainstate,
                 prev_keys: vec![],
@@ -1486,14 +1700,14 @@ pub mod test {
                 };
 
                 if StacksChainState::has_stored_block(
-                    &self.chainstate.blocks_db,
+                    &self.chainstate.db(),
                     &self.chainstate.blocks_path,
                     &consensus_hash,
                     &bc.block_header_hash,
                 )
                 .unwrap()
                     && !StacksChainState::is_block_orphaned(
-                        &self.chainstate.blocks_db,
+                        &self.chainstate.db(),
                         &consensus_hash,
                         &bc.block_header_hash,
                     )
@@ -1666,7 +1880,7 @@ pub mod test {
                     };
 
                     let parent_chain_tip = StacksChainState::get_anchored_block_header_info(
-                        self.chainstate.headers_db(),
+                        self.chainstate.db(),
                         &parent_stacks_block_snapshot.consensus_hash,
                         &parent_stacks_block.header.block_hash(),
                     )
@@ -1845,22 +2059,107 @@ pub mod test {
         block_height: u64,
         prev_block_rewards: &Vec<Vec<MinerPaymentSchedule>>,
     ) -> bool {
-        let mut total: u128 = 0;
-        if block_height >= MINER_REWARD_MATURITY + MINER_REWARD_WINDOW {
+        let mut block_rewards = HashMap::new();
+        let mut stream_rewards = HashMap::new();
+        let mut heights = HashMap::new();
+        let mut confirmed = HashSet::new();
+        for (i, reward_list) in prev_block_rewards.iter().enumerate() {
+            for reward in reward_list.iter() {
+                let ibh = StacksBlockHeader::make_index_block_hash(
+                    &reward.consensus_hash,
+                    &reward.block_hash,
+                );
+                if reward.coinbase > 0 {
+                    block_rewards.insert(ibh.clone(), reward.clone());
+                }
+                if reward.tx_fees_streamed > 0 {
+                    stream_rewards.insert(ibh.clone(), reward.clone());
+                }
+                heights.insert(ibh.clone(), i);
+                confirmed.insert((
+                    StacksBlockHeader::make_index_block_hash(
+                        &reward.parent_consensus_hash,
+                        &reward.parent_block_hash,
+                    ),
+                    i,
+                ));
+            }
+        }
+
+        // what was the miner's total spend?
+        let miner_nonce = clarity_tx.with_clarity_db_readonly(|db| {
+            db.get_account_nonce(
+                &StandardPrincipalData::from(miner.origin_address().unwrap()).into(),
+            )
+        });
+
+        let mut spent_total = 0;
+        for (nonce, spent) in miner.spent_at_nonce.iter() {
+            if *nonce < miner_nonce {
+                spent_total += *spent;
+            }
+        }
+
+        let mut total: u128 = 10_000_000_000 - spent_total;
+        test_debug!(
+            "Miner {} has spent {} in total so far",
+            &miner.origin_address().unwrap(),
+            spent_total
+        );
+
+        if block_height >= MINER_REWARD_MATURITY {
             for (i, prev_block_reward) in prev_block_rewards.iter().enumerate() {
-                if i as u64 > block_height - MINER_REWARD_MATURITY - MINER_REWARD_WINDOW {
+                if i as u64 > block_height - MINER_REWARD_MATURITY {
                     break;
                 }
+                let mut found = false;
                 for recipient in prev_block_reward {
                     if recipient.address == miner.origin_address().unwrap() {
-                        let reward: u128 = recipient.coinbase; // TODO: expand to cover tx fees
+                        let reward: u128 = recipient.coinbase
+                            + recipient.tx_fees_anchored
+                            + (3 * recipient.tx_fees_streamed / 5);
+
                         test_debug!(
-                            "Miner {} received a reward {} at block {}",
+                            "Miner {} received a reward {} = {} + {} + {} at block {}",
                             &recipient.address.to_string(),
                             reward,
+                            recipient.coinbase,
+                            recipient.tx_fees_anchored,
+                            (3 * recipient.tx_fees_streamed / 5),
                             i
                         );
                         total += reward;
+                        found = true;
+                    }
+                }
+                if !found {
+                    test_debug!(
+                        "Miner {} received no reward at block {}",
+                        miner.origin_address().unwrap(),
+                        i
+                    );
+                }
+            }
+
+            for (parent_block, confirmed_block_height) in confirmed.into_iter() {
+                if confirmed_block_height as u64 > block_height - MINER_REWARD_MATURITY {
+                    continue;
+                }
+                if let Some(ref parent_reward) = stream_rewards.get(&parent_block) {
+                    if parent_reward.address == miner.origin_address().unwrap() {
+                        let parent_streamed = (2 * parent_reward.tx_fees_streamed) / 5;
+                        let parent_ibh = StacksBlockHeader::make_index_block_hash(
+                            &parent_reward.consensus_hash,
+                            &parent_reward.block_hash,
+                        );
+                        test_debug!(
+                            "Miner {} received a produced-stream reward {} from {} confirmed at {}",
+                            miner.origin_address().unwrap().to_string(),
+                            parent_streamed,
+                            heights.get(&parent_ibh).unwrap(),
+                            confirmed_block_height
+                        );
+                        total += parent_streamed;
                     }
                 }
             }
@@ -1915,11 +2214,12 @@ pub mod test {
         block_height: u64,
     ) -> Vec<Vec<MinerPaymentSchedule>> {
         let mut ret = vec![];
-        let mut tx = chainstate.headers_tx_begin().unwrap();
+        let mut tx = chainstate.index_tx_begin().unwrap();
 
         for i in 0..block_height {
             let block_rewards =
-                StacksChainState::get_scheduled_block_rewards_in_fork(&mut tx, tip, i).unwrap();
+                StacksChainState::get_scheduled_block_rewards_in_fork_at_height(&mut tx, tip, i)
+                    .unwrap();
             ret.push(block_rewards);
         }
 
@@ -1964,11 +2264,17 @@ pub mod test {
         G: FnMut(&StacksBlock, &Vec<StacksMicroblock>) -> bool,
     {
         let full_test_name = format!("{}-1_fork_1_miner_1_burnchain", test_name);
-        let mut node = TestStacksNode::new(false, 0x80000000, &full_test_name);
         let mut burn_node = TestBurnchainNode::new();
         let mut miner_factory = TestMinerFactory::new();
         let mut miner =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
+
+        let mut node = TestStacksNode::new(
+            false,
+            0x80000000,
+            &full_test_name,
+            vec![miner.origin_address().unwrap()],
+        );
 
         let first_snapshot =
             SortitionDB::get_first_block_snapshot(burn_node.sortdb.conn()).unwrap();
@@ -2130,13 +2436,22 @@ pub mod test {
         ) -> (StacksBlock, Vec<StacksMicroblock>),
     {
         let full_test_name = format!("{}-1_fork_2_miners_1_burnchain", test_name);
-        let mut node = TestStacksNode::new(false, 0x80000000, &full_test_name);
         let mut burn_node = TestBurnchainNode::new();
         let mut miner_factory = TestMinerFactory::new();
         let mut miner_1 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
         let mut miner_2 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
+
+        let mut node = TestStacksNode::new(
+            false,
+            0x80000000,
+            &full_test_name,
+            vec![
+                miner_1.origin_address().unwrap(),
+                miner_2.origin_address().unwrap(),
+            ],
+        );
 
         let mut sortition_winners = vec![];
 
@@ -2557,13 +2872,22 @@ pub mod test {
         ) -> (StacksBlock, Vec<StacksMicroblock>),
     {
         let full_test_name = format!("{}-2_forks_2_miners_1_burnchain", test_name);
-        let mut node = TestStacksNode::new(false, 0x80000000, &full_test_name);
         let mut burn_node = TestBurnchainNode::new();
         let mut miner_factory = TestMinerFactory::new();
         let mut miner_1 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
         let mut miner_2 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
+
+        let mut node = TestStacksNode::new(
+            false,
+            0x80000000,
+            &full_test_name,
+            vec![
+                miner_1.origin_address().unwrap(),
+                miner_2.origin_address().unwrap(),
+            ],
+        );
 
         let mut sortition_winners = vec![];
 
@@ -3137,12 +3461,21 @@ pub mod test {
     {
         let full_test_name = format!("{}-1_fork_2_miners_2_burnchain", test_name);
         let mut burn_node = TestBurnchainNode::new();
-        let mut node = TestStacksNode::new(false, 0x80000000, &full_test_name);
         let mut miner_factory = TestMinerFactory::new();
         let mut miner_1 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
         let mut miner_2 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
+
+        let mut node = TestStacksNode::new(
+            false,
+            0x80000000,
+            &full_test_name,
+            vec![
+                miner_1.origin_address().unwrap(),
+                miner_2.origin_address().unwrap(),
+            ],
+        );
 
         let first_snapshot =
             SortitionDB::get_first_block_snapshot(burn_node.sortdb.conn()).unwrap();
@@ -3667,12 +4000,21 @@ pub mod test {
     {
         let full_test_name = format!("{}-2_forks_2_miner_2_burnchains", test_name);
         let mut burn_node = TestBurnchainNode::new();
-        let mut node = TestStacksNode::new(false, 0x80000000, &full_test_name);
         let mut miner_factory = TestMinerFactory::new();
         let mut miner_1 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
         let mut miner_2 =
             miner_factory.next_miner(&burn_node.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
+
+        let mut node = TestStacksNode::new(
+            false,
+            0x80000000,
+            &full_test_name,
+            vec![
+                miner_1.origin_address().unwrap(),
+                miner_2.origin_address().unwrap(),
+            ],
+        );
 
         let first_snapshot =
             SortitionDB::get_first_block_snapshot(burn_node.sortdb.conn()).unwrap();
@@ -4177,8 +4519,8 @@ pub mod test {
         let ch2 = open_chainstate(false, 0x80000000, test_name_2);
 
         // check presence of anchored blocks
-        let mut all_blocks_1 = StacksChainState::list_blocks(&ch1.blocks_db).unwrap();
-        let mut all_blocks_2 = StacksChainState::list_blocks(&ch2.blocks_db).unwrap();
+        let mut all_blocks_1 = StacksChainState::list_blocks(&ch1.db()).unwrap();
+        let mut all_blocks_2 = StacksChainState::list_blocks(&ch2.db()).unwrap();
 
         all_blocks_1.sort();
         all_blocks_2.sort();
@@ -4190,9 +4532,9 @@ pub mod test {
 
         // check presence and ordering of microblocks
         let mut all_microblocks_1 =
-            StacksChainState::list_microblocks(&ch1.blocks_db, &ch1.blocks_path).unwrap();
+            StacksChainState::list_microblocks(&ch1.db(), &ch1.blocks_path).unwrap();
         let mut all_microblocks_2 =
-            StacksChainState::list_microblocks(&ch2.blocks_db, &ch2.blocks_path).unwrap();
+            StacksChainState::list_microblocks(&ch2.db(), &ch2.blocks_path).unwrap();
 
         all_microblocks_1.sort();
         all_microblocks_2.sort();
@@ -4211,14 +4553,14 @@ pub mod test {
         // compare block status (staging vs confirmed) and contents
         for i in 0..all_blocks_1.len() {
             let staging_1_opt = StacksChainState::load_staging_block(
-                &ch1.blocks_db,
+                &ch1.db(),
                 &ch2.blocks_path,
                 &all_blocks_1[i].0,
                 &all_blocks_1[i].1,
             )
             .unwrap();
             let staging_2_opt = StacksChainState::load_staging_block(
-                &ch2.blocks_db,
+                &ch2.db(),
                 &ch2.blocks_path,
                 &all_blocks_2[i].0,
                 &all_blocks_2[i].1,
@@ -4263,19 +4605,24 @@ pub mod test {
             if all_microblocks_1[i].2.len() == 0 {
                 continue;
             }
-            let chunk_1_opt = StacksChainState::load_staging_microblock_stream(
-                &ch1.blocks_db,
-                &ch1.blocks_path,
-                &all_microblocks_1[i].0,
-                &all_microblocks_1[i].1,
+
+            let chunk_1_opt = StacksChainState::load_descendant_staging_microblock_stream(
+                &ch1.db(),
+                &StacksBlockHeader::make_index_block_hash(
+                    &all_microblocks_1[i].0,
+                    &all_microblocks_1[i].1,
+                ),
+                0,
                 u16::max_value(),
             )
             .unwrap();
-            let chunk_2_opt = StacksChainState::load_staging_microblock_stream(
-                &ch1.blocks_db,
-                &ch2.blocks_path,
-                &all_microblocks_2[i].0,
-                &all_microblocks_2[i].1,
+            let chunk_2_opt = StacksChainState::load_descendant_staging_microblock_stream(
+                &ch1.db(),
+                &StacksBlockHeader::make_index_block_hash(
+                    &all_microblocks_2[i].0,
+                    &all_microblocks_2[i].1,
+                ),
+                0,
                 u16::max_value(),
             )
             .unwrap();
@@ -4292,14 +4639,14 @@ pub mod test {
             for j in 0..all_microblocks_1[i].2.len() {
                 // staging status is the same
                 let staging_1_opt = StacksChainState::load_staging_microblock(
-                    &ch1.blocks_db,
+                    &ch1.db(),
                     &all_microblocks_1[i].0,
                     &all_microblocks_1[i].1,
                     &all_microblocks_1[i].2[j],
                 )
                 .unwrap();
                 let staging_2_opt = StacksChainState::load_staging_microblock(
-                    &ch2.blocks_db,
+                    &ch2.db(),
                     &all_microblocks_2[i].0,
                     &all_microblocks_2[i].1,
                     &all_microblocks_2[i].2[j],
@@ -4335,7 +4682,16 @@ pub mod test {
         let mut nodes = HashMap::new();
         for (i, test_name) in test_names.iter().enumerate() {
             let rnd_test_name = format!("{}-replay_randomized", test_name);
-            let next_node = TestStacksNode::new(false, 0x80000000, &rnd_test_name);
+            let next_node = TestStacksNode::new(
+                false,
+                0x80000000,
+                &rnd_test_name,
+                miner_trace
+                    .miners
+                    .iter()
+                    .map(|ref miner| miner.origin_address().unwrap())
+                    .collect(),
+            );
             nodes.insert(test_name, next_node);
         }
 
@@ -4456,6 +4812,14 @@ pub mod test {
     }
 
     pub fn make_coinbase(miner: &mut TestMiner, burnchain_height: usize) -> StacksTransaction {
+        make_coinbase_with_nonce(miner, burnchain_height, miner.get_nonce())
+    }
+
+    pub fn make_coinbase_with_nonce(
+        miner: &mut TestMiner,
+        burnchain_height: usize,
+        nonce: u64,
+    ) -> StacksTransaction {
         // make a coinbase for this miner
         let mut tx_coinbase = StacksTransaction::new(
             TransactionVersion::Testnet,
@@ -4464,7 +4828,7 @@ pub mod test {
         );
         tx_coinbase.chain_id = 0x80000000;
         tx_coinbase.anchor_mode = TransactionAnchorMode::OnChainOnly;
-        tx_coinbase.auth.set_origin_nonce(miner.get_nonce());
+        tx_coinbase.auth.set_origin_nonce(nonce);
 
         let mut tx_signer = StacksTransactionSigner::new(&tx_coinbase);
         miner.sign_as_origin(&mut tx_signer);
@@ -4509,10 +4873,15 @@ pub mod test {
         burnchain_height: usize,
         parent_microblock_header: Option<&StacksMicroblockHeader>,
     ) -> (StacksBlock, Vec<StacksMicroblock>) {
+        let mut pubkh_bytes = [0u8; 20];
+        pubkh_bytes[0..8].copy_from_slice(&burnchain_height.to_be_bytes());
+        assert!(builder.set_microblock_pubkey_hash(Hash160(pubkh_bytes)));
+
         let miner_account = StacksChainState::get_account(
             clarity_tx,
             &miner.origin_address().unwrap().to_account_principal(),
         );
+
         miner.set_nonce(miner_account.nonce);
 
         // make a coinbase for this miner
@@ -4522,12 +4891,7 @@ pub mod test {
             .try_mine_tx(clarity_tx, &tx_coinbase_signed)
             .unwrap();
 
-        let mut stacks_block = builder.mine_anchored_block(clarity_tx);
-
-        let mut pubkh_bytes = [0u8; 20];
-        pubkh_bytes[0..8].copy_from_slice(&burnchain_height.to_be_bytes());
-
-        stacks_block.header.microblock_pubkey_hash = Hash160(pubkh_bytes);
+        let stacks_block = builder.mine_anchored_block(clarity_tx);
 
         test_debug!(
             "Produce anchored stacks block at burnchain height {} stacks height {} pubkeyhash {}",
@@ -4545,6 +4909,10 @@ pub mod test {
         burnchain_height: usize,
         parent_microblock_header: Option<&StacksMicroblockHeader>,
     ) -> (StacksBlock, Vec<StacksMicroblock>) {
+        let mut pubkh_bytes = [0u8; 20];
+        pubkh_bytes[0..8].copy_from_slice(&burnchain_height.to_be_bytes());
+        assert!(builder.set_microblock_pubkey_hash(Hash160(pubkh_bytes)));
+
         let miner_account = StacksChainState::get_account(
             clarity_tx,
             &miner.origin_address().unwrap().to_account_principal(),
@@ -4558,12 +4926,7 @@ pub mod test {
             .try_mine_tx(clarity_tx, &tx_coinbase_signed)
             .unwrap();
 
-        let mut stacks_block = builder.mine_anchored_block(clarity_tx);
-
-        let mut pubkh_bytes = [0u8; 20];
-        pubkh_bytes[0..8].copy_from_slice(&stacks_block.header.total_work.work.to_be_bytes());
-
-        stacks_block.header.microblock_pubkey_hash = Hash160(pubkh_bytes);
+        let stacks_block = builder.mine_anchored_block(clarity_tx);
 
         test_debug!(
             "Produce anchored stacks block at burnchain height {} stacks height {} pubkeyhash {}",
@@ -4604,7 +4967,13 @@ pub mod test {
 
         tx_contract.chain_id = 0x80000000;
         tx_contract.auth.set_origin_nonce(miner.get_nonce());
-        tx_contract.set_fee_rate(0);
+
+        if miner.test_with_tx_fees {
+            tx_contract.set_tx_fee(123);
+            miner.spent_at_nonce.insert(miner.get_nonce(), 123);
+        } else {
+            tx_contract.set_tx_fee(0);
+        }
 
         let mut tx_signer = StacksTransactionSigner::new(&tx_contract);
         miner.sign_as_origin(&mut tx_signer);
@@ -4636,7 +5005,13 @@ pub mod test {
 
         tx_contract_call.chain_id = 0x80000000;
         tx_contract_call.auth.set_origin_nonce(miner.get_nonce());
-        tx_contract_call.set_fee_rate(0);
+
+        if miner.test_with_tx_fees {
+            tx_contract_call.set_tx_fee(456);
+            miner.spent_at_nonce.insert(miner.get_nonce(), 456);
+        } else {
+            tx_contract_call.set_tx_fee(0);
+        }
 
         let mut tx_signer = StacksTransactionSigner::new(&tx_contract_call);
         miner.sign_as_origin(&mut tx_signer);
@@ -4664,7 +5039,7 @@ pub mod test {
         tx_stx_transfer
             .auth
             .set_origin_nonce(nonce.unwrap_or(miner.get_nonce()));
-        tx_stx_transfer.set_fee_rate(0);
+        tx_stx_transfer.set_tx_fee(0);
 
         let mut tx_signer = StacksTransactionSigner::new(&tx_stx_transfer);
         miner.sign_as_origin(&mut tx_signer);
@@ -4704,6 +5079,10 @@ pub mod test {
         );
         builder.force_mine_tx(clarity_tx, &tx1).unwrap();
 
+        if miner.spent_at_nonce.get(&1).is_none() {
+            miner.spent_at_nonce.insert(1, 11111);
+        }
+
         let tx2 = make_token_transfer(
             miner,
             burnchain_height,
@@ -4713,6 +5092,10 @@ pub mod test {
             &TokenTransferMemo([2u8; 34]),
         );
         builder.force_mine_tx(clarity_tx, &tx2).unwrap();
+
+        if miner.spent_at_nonce.get(&2).is_none() {
+            miner.spent_at_nonce.insert(2, 22222);
+        }
 
         let tx3 = make_token_transfer(
             miner,
@@ -4737,6 +5120,7 @@ pub mod test {
         let stacks_block = builder.mine_anchored_block(clarity_tx);
 
         test_debug!("Produce anchored stacks block {} with invalid token transfers at burnchain height {} stacks height {}", stacks_block.block_hash(), burnchain_height, stacks_block.header.total_work.work);
+
         (stacks_block, vec![])
     }
 
@@ -5514,7 +5898,7 @@ pub mod test {
                 .unwrap()
                 .unwrap();
                 assert!(StacksChainState::is_block_orphaned(
-                    &chainstate.blocks_db,
+                    &chainstate.db(),
                     &sn.consensus_hash,
                     &bc.block_header_hash
                 )
@@ -5528,7 +5912,7 @@ pub mod test {
     pub fn make_user_contract_publish(
         sender: &StacksPrivateKey,
         nonce: u64,
-        fee_rate: u64,
+        tx_fee: u64,
         contract_name: &str,
         contract_content: &str,
     ) -> StacksTransaction {
@@ -5537,13 +5921,13 @@ pub mod test {
 
         let payload = TransactionSmartContract { name, code_body };
 
-        sign_standard_singlesig_tx(payload.into(), sender, nonce, fee_rate)
+        sign_standard_singlesig_tx(payload.into(), sender, nonce, tx_fee)
     }
 
     pub fn make_user_stacks_transfer(
         sender: &StacksPrivateKey,
         nonce: u64,
-        fee_rate: u64,
+        tx_fee: u64,
         recipient: &PrincipalData,
         amount: u64,
     ) -> StacksTransaction {
@@ -5552,30 +5936,39 @@ pub mod test {
             amount,
             TokenTransferMemo([0; 34]),
         );
-        sign_standard_singlesig_tx(payload.into(), sender, nonce, fee_rate)
+        sign_standard_singlesig_tx(payload.into(), sender, nonce, tx_fee)
     }
 
     pub fn make_user_coinbase(
         sender: &StacksPrivateKey,
         nonce: u64,
-        fee_rate: u64,
+        tx_fee: u64,
     ) -> StacksTransaction {
         let payload = TransactionPayload::Coinbase(CoinbasePayload([0; 32]));
-        sign_standard_singlesig_tx(payload.into(), sender, nonce, fee_rate)
+        sign_standard_singlesig_tx(payload.into(), sender, nonce, tx_fee)
+    }
+
+    pub fn make_user_poison_microblock(
+        sender: &StacksPrivateKey,
+        nonce: u64,
+        tx_fee: u64,
+        payload: TransactionPayload,
+    ) -> StacksTransaction {
+        sign_standard_singlesig_tx(payload.into(), sender, nonce, tx_fee)
     }
 
     pub fn sign_standard_singlesig_tx(
         payload: TransactionPayload,
         sender: &StacksPrivateKey,
         nonce: u64,
-        fee_rate: u64,
+        tx_fee: u64,
     ) -> StacksTransaction {
         let mut spending_condition = TransactionSpendingCondition::new_singlesig_p2pkh(
             StacksPublicKey::from_private(sender),
         )
         .expect("Failed to create p2pkh spending condition from public key.");
         spending_condition.set_nonce(nonce);
-        spending_condition.set_fee_rate(fee_rate);
+        spending_condition.set_tx_fee(tx_fee);
         let auth = TransactionAuth::Standard(spending_condition);
         let mut unsigned_tx = StacksTransaction::new(TransactionVersion::Testnet, auth, payload);
 
@@ -5626,8 +6019,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -5639,7 +6031,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -5727,8 +6119,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -5740,7 +6131,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -5769,7 +6160,12 @@ pub mod test {
                         sender_nonce += 1;
 
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, stx_transfer)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                stx_transfer,
+                            )
                             .unwrap();
                     }
                     let anchored_block = StacksBlockBuilder::build_anchored_block(
@@ -5862,8 +6258,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -5875,7 +6270,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -5903,7 +6298,12 @@ pub mod test {
                                 1,
                             );
                             mempool
-                                .submit(&parent_consensus_hash, &parent_header_hash, stx_transfer)
+                                .submit(
+                                    chainstate,
+                                    &parent_consensus_hash,
+                                    &parent_header_hash,
+                                    stx_transfer,
+                                )
                                 .unwrap();
                         }
 
@@ -5920,7 +6320,12 @@ pub mod test {
                                 1,
                             );
                             mempool
-                                .submit(&parent_consensus_hash, &parent_header_hash, stx_transfer)
+                                .submit(
+                                    chainstate,
+                                    &parent_consensus_hash,
+                                    &parent_header_hash,
+                                    stx_transfer,
+                                )
                                 .unwrap();
                         }
 
@@ -6045,8 +6450,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -6058,7 +6462,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -6098,7 +6502,12 @@ pub mod test {
                             1,
                         );
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, stx_transfer)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                stx_transfer,
+                            )
                             .unwrap();
 
                         // will never get mined
@@ -6111,7 +6520,12 @@ pub mod test {
                         );
 
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, contract_tx)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                contract_tx,
+                            )
                             .unwrap();
 
                         // will get mined last
@@ -6123,7 +6537,12 @@ pub mod test {
                             1,
                         );
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, stx_transfer)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                stx_transfer,
+                            )
                             .unwrap();
 
                         sender_nonce += 1;
@@ -6226,8 +6645,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -6239,7 +6657,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -6269,7 +6687,12 @@ pub mod test {
                             &contract,
                         );
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, contract_tx)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                contract_tx,
+                            )
                             .unwrap();
                     }
 
@@ -6366,8 +6789,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -6379,7 +6801,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -6423,7 +6845,12 @@ pub mod test {
                             &contract,
                         );
                         mempool
-                            .submit(&parent_consensus_hash, &parent_header_hash, contract_tx)
+                            .submit(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                contract_tx,
+                            )
                             .unwrap();
                     }
 
@@ -6504,8 +6931,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -6517,7 +6943,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -6553,6 +6979,7 @@ pub mod test {
                             .unwrap();
                         mempool
                             .submit_raw(
+                                chainstate,
                                 &parent_consensus_hash,
                                 &parent_header_hash,
                                 contract_tx_bytes,
@@ -6577,6 +7004,7 @@ pub mod test {
                             .unwrap();
                         mempool
                             .submit_raw(
+                                chainstate,
                                 &parent_consensus_hash,
                                 &parent_header_hash,
                                 contract_tx_bytes,
@@ -6700,7 +7128,7 @@ pub mod test {
                             assert!(tenure_id != bad_block_tenure + 1);
                             match parent_opt {
                                 None => {
-                                    StacksChainState::get_genesis_header_info(chainstate.headers_db()).unwrap()
+                                    StacksChainState::get_genesis_header_info(chainstate.db()).unwrap()
                                 }
                                 Some(ref block) => {
                                     let ic = sortdb.index_conn();
@@ -6713,7 +7141,7 @@ pub mod test {
                                         };
 
                                     let snapshot = SortitionDB::get_block_snapshot_for_winning_stacks_block(&ic, &tip.sortition_id, &parent_block_hash).unwrap().unwrap();      // succeeds because we don't fork
-                                    StacksChainState::get_anchored_block_header_info(chainstate.headers_db(), &snapshot.consensus_hash, &snapshot.winning_stacks_block_hash).unwrap().unwrap()
+                                    StacksChainState::get_anchored_block_header_info(chainstate.db(), &snapshot.consensus_hash, &snapshot.winning_stacks_block_hash).unwrap().unwrap()
                                 }
                             }
                         }
@@ -6868,8 +7296,7 @@ pub mod test {
                  ref parent_opt,
                  ref parent_microblock_header_opt| {
                     let parent_tip = match parent_opt {
-                        None => StacksChainState::get_genesis_header_info(chainstate.headers_db())
-                            .unwrap(),
+                        None => StacksChainState::get_genesis_header_info(chainstate.db()).unwrap(),
                         Some(block) => {
                             let ic = sortdb.index_conn();
                             let snapshot =
@@ -6881,7 +7308,7 @@ pub mod test {
                                 .unwrap()
                                 .unwrap(); // succeeds because we don't fork
                             StacksChainState::get_anchored_block_header_info(
-                                chainstate.headers_db(),
+                                chainstate.db(),
                                 &snapshot.consensus_hash,
                                 &snapshot.winning_stacks_block_hash,
                             )
@@ -6916,7 +7343,12 @@ pub mod test {
                             .consensus_serialize(&mut contract_tx_bytes)
                             .unwrap();
                         mempool
-                            .submit_raw(&parent_tip_ch, &parent_header_hash, contract_tx_bytes)
+                            .submit_raw(
+                                chainstate,
+                                &parent_tip_ch,
+                                &parent_header_hash,
+                                contract_tx_bytes,
+                            )
                             .unwrap();
 
                         eprintln!("first tx submitted");
@@ -6937,7 +7369,12 @@ pub mod test {
                             .consensus_serialize(&mut contract_tx_bytes)
                             .unwrap();
                         mempool
-                            .submit_raw(&parent_tip_ch, &parent_header_hash, contract_tx_bytes)
+                            .submit_raw(
+                                chainstate,
+                                &parent_tip_ch,
+                                &parent_header_hash,
+                                contract_tx_bytes,
+                            )
                             .unwrap();
 
                         eprintln!("second tx submitted");
@@ -6966,7 +7403,12 @@ pub mod test {
                             .consensus_serialize(&mut contract_tx_bytes)
                             .unwrap();
                         mempool
-                            .submit_raw(&parent_tip_ch, &parent_header_hash, contract_tx_bytes)
+                            .submit_raw(
+                                chainstate,
+                                &parent_tip_ch,
+                                &parent_header_hash,
+                                contract_tx_bytes,
+                            )
                             .unwrap();
 
                         eprintln!("third tx submitted");
@@ -6987,7 +7429,12 @@ pub mod test {
                             .consensus_serialize(&mut contract_tx_bytes)
                             .unwrap();
                         mempool
-                            .submit_raw(&parent_tip_ch, &parent_header_hash, contract_tx_bytes)
+                            .submit_raw(
+                                chainstate,
+                                &parent_tip_ch,
+                                &parent_header_hash,
+                                contract_tx_bytes,
+                            )
                             .unwrap();
 
                         eprintln!("fourth tx submitted");
@@ -7028,6 +7475,782 @@ pub mod test {
         }
     }
 
+    fn get_stacks_account(peer: &mut TestPeer, addr: &PrincipalData) -> StacksAccount {
+        let account = peer
+            .with_db_state(|ref mut sortdb, ref mut chainstate, _, _| {
+                let (consensus_hash, block_bhh) =
+                    SortitionDB::get_canonical_stacks_chain_tip_hash(sortdb.conn()).unwrap();
+                let stacks_block_id =
+                    StacksBlockHeader::make_index_block_hash(&consensus_hash, &block_bhh);
+                let acct = chainstate
+                    .with_read_only_clarity_tx(
+                        &sortdb.index_conn(),
+                        &stacks_block_id,
+                        |clarity_tx| StacksChainState::get_account(clarity_tx, addr),
+                    )
+                    .unwrap();
+                Ok(acct)
+            })
+            .unwrap();
+        account
+    }
+
+    #[test]
+    fn test_build_microblock_stream_forks() {
+        let mut privks = vec![];
+        let mut addrs = vec![];
+        let mut mblock_privks = vec![];
+        let mut balances = vec![];
+        let num_blocks = 10;
+        let initial_balance = 100000000;
+
+        for _ in 0..num_blocks {
+            let privk = StacksPrivateKey::new();
+            let mblock_privk = StacksPrivateKey::new();
+
+            let addr = StacksAddress::from_public_keys(
+                C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+                &AddressHashMode::SerializeP2PKH,
+                1,
+                &vec![StacksPublicKey::from_private(&privk)],
+            )
+            .unwrap();
+
+            addrs.push(addr.clone());
+            privks.push(privk);
+            mblock_privks.push(mblock_privk);
+            balances.push((addr.to_account_principal(), initial_balance));
+        }
+
+        let mut peer_config = TestPeerConfig::new("test_build_microblock_stream_forks", 2014, 2015);
+        peer_config.initial_balances = balances;
+
+        let mut peer = TestPeer::new(peer_config);
+
+        let chainstate_path = peer.chainstate_path.clone();
+
+        let first_stacks_block_height = {
+            let sn =
+                SortitionDB::get_canonical_burn_chain_tip(&peer.sortdb.as_ref().unwrap().conn())
+                    .unwrap();
+            sn.block_height
+        };
+
+        let recipient_addr_str = "ST1RFD5Q2QPK3E0F08HG9XDX7SSC7CNRS0QR0SGEV";
+        let recipient = StacksAddress::from_string(recipient_addr_str).unwrap();
+
+        let mut last_block = None;
+        for tenure_id in 0..num_blocks {
+            // send transactions to the mempool
+            let tip =
+                SortitionDB::get_canonical_burn_chain_tip(&peer.sortdb.as_ref().unwrap().conn())
+                    .unwrap();
+
+            let (burn_ops, stacks_block, microblocks) = peer.make_tenure(
+                |ref mut miner,
+                 ref mut sortdb,
+                 ref mut chainstate,
+                 vrf_proof,
+                 ref parent_opt,
+                 ref parent_microblock_header_opt| {
+                    let parent_tip = match parent_opt {
+                        None => StacksChainState::get_genesis_header_info(chainstate.db())
+                            .unwrap(),
+                        Some(block) => {
+                            let ic = sortdb.index_conn();
+                            let snapshot =
+                                SortitionDB::get_block_snapshot_for_winning_stacks_block(
+                                    &ic,
+                                    &tip.sortition_id,
+                                    &block.block_hash(),
+                                )
+                                .unwrap()
+                                .unwrap(); // succeeds because we don't fork
+                            StacksChainState::get_anchored_block_header_info(
+                                chainstate.db(),
+                                &snapshot.consensus_hash,
+                                &snapshot.winning_stacks_block_hash,
+                            )
+                            .unwrap()
+                            .unwrap()
+                        }
+                    };
+
+                    let parent_header_hash = parent_tip.anchored_header.block_hash();
+                    let parent_consensus_hash = parent_tip.consensus_hash.clone();
+                    let parent_index_hash = StacksBlockHeader::make_index_block_hash(&parent_consensus_hash, &parent_header_hash);
+                    let parent_size = parent_tip.anchored_block_size;
+
+                    let mut mempool = MemPoolDB::open(false, 0x80000000, &chainstate_path).unwrap();
+
+                    let expected_parent_microblock_opt =
+                        if tenure_id > 0 {
+                            let parent_microblock_privkey = mblock_privks[tenure_id - 1].clone();
+
+                            let parent_mblock_stream = {
+                                let parent_cost = StacksChainState::get_stacks_block_anchored_cost(chainstate.db(), &StacksBlockHeader::make_index_block_hash(&parent_consensus_hash, &parent_header_hash)).unwrap().unwrap();
+
+                                // produce the microblock stream for the parent, which this tenure's anchor
+                                // block will confirm.
+                                let sort_ic = sortdb.index_conn();
+
+                                chainstate
+                                    .reload_unconfirmed_state(&sort_ic, parent_index_hash.clone())
+                                    .unwrap();
+
+                                let mut microblock_builder = StacksMicroblockBuilder::new(parent_header_hash.clone(), parent_consensus_hash.clone(), chainstate, &sort_ic).unwrap();
+
+                                let mut microblocks = vec![];
+                                for i in 0..5 {
+                                    let mblock_tx = make_user_contract_publish(
+                                        &privks[tenure_id - 1],
+                                        i,
+                                        0,
+                                        &format!("hello-world-{}-{}", i, thread_rng().gen::<u64>()),
+                                        &format!("(begin (print \"{}\"))", thread_rng().gen::<u64>())
+                                    );
+                                    let mblock_tx_len = {
+                                        let mut bytes = vec![];
+                                        mblock_tx.consensus_serialize(&mut bytes).unwrap();
+                                        bytes.len() as u64
+                                    };
+
+                                    let mblock = microblock_builder.mine_next_microblock_from_txs(vec![(mblock_tx, mblock_tx_len)], &parent_microblock_privkey).unwrap();
+                                    microblocks.push(mblock);
+                                }
+                                microblocks
+                            };
+
+                            // make a fork at seq 2
+                            let mut forked_parent_microblock_stream = parent_mblock_stream.clone();
+                            for i in 2..forked_parent_microblock_stream.len() {
+                                let forked_mblock_tx = make_user_contract_publish(
+                                    &privks[tenure_id - 1],
+                                    i as u64,
+                                    0,
+                                    &format!("hello-world-fork-{}-{}", i, thread_rng().gen::<u64>()),
+                                    &format!("(begin (print \"fork-{}\"))", thread_rng().gen::<u64>())
+                                );
+
+                                forked_parent_microblock_stream[i].txs[0] = forked_mblock_tx;
+
+                                // re-calculate merkle root
+                                let txid_vecs = forked_parent_microblock_stream[i].txs
+                                    .iter()
+                                    .map(|tx| tx.txid().as_bytes().to_vec())
+                                    .collect();
+
+                                let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&txid_vecs);
+                                let tx_merkle_root = merkle_tree.root();
+
+                                forked_parent_microblock_stream[i].header.tx_merkle_root = tx_merkle_root;
+                                forked_parent_microblock_stream[i].header.prev_block = forked_parent_microblock_stream[i-1].block_hash();
+                                forked_parent_microblock_stream[i].header.sign(&parent_microblock_privkey).unwrap();
+
+                                test_debug!("parent of microblock {} is {}", &forked_parent_microblock_stream[i].block_hash(), &forked_parent_microblock_stream[i-1].block_hash());
+                            }
+
+                            let mut tail = None;
+
+                            // store two forks, which diverge at seq 2
+                            for mblock in parent_mblock_stream.into_iter() {
+                                if mblock.header.sequence < 2 {
+                                    tail = Some((mblock.block_hash(), mblock.header.sequence));
+                                }
+                                let stored = chainstate.preprocess_streamed_microblock(&parent_consensus_hash, &parent_header_hash, &mblock).unwrap();
+                                assert!(stored);
+                            }
+                            for mblock in forked_parent_microblock_stream[2..].iter() {
+                                let stored = chainstate.preprocess_streamed_microblock(&parent_consensus_hash, &parent_header_hash, mblock).unwrap();
+                                assert!(stored);
+                            }
+
+                            // find the poison-microblock at seq 2
+                            let (_, poison_opt) = match StacksChainState::load_descendant_staging_microblock_stream_with_poison(
+                                &chainstate.db(),
+                                &parent_index_hash,
+                                0,
+                                u16::MAX
+                            ).unwrap() {
+                                Some(x) => x,
+                                None => (vec![], None)
+                            };
+
+                            if let Some(poison_payload) = poison_opt {
+                                let mut tx_bytes = vec![];
+                                let poison_microblock_tx = make_user_poison_microblock(
+                                    &privks[tenure_id - 1],
+                                    2,
+                                    0,
+                                    poison_payload
+                                );
+
+                                poison_microblock_tx
+                                    .consensus_serialize(&mut tx_bytes)
+                                    .unwrap();
+
+                                mempool
+                                    .submit_raw(
+                                        chainstate,
+                                        &parent_consensus_hash,
+                                        &parent_header_hash,
+                                        tx_bytes,
+                                    )
+                                    .unwrap();
+                            }
+                            // the miner will load a microblock stream up to the first detected
+                            // fork (which is at sequence 2)
+                            tail
+                        }
+                        else {
+                            None
+                        };
+
+                    let coinbase_tx = make_coinbase(miner, tenure_id);
+
+                    let mblock_pubkey_hash = Hash160::from_node_public_key(&StacksPublicKey::from_private(&mblock_privks[tenure_id]));
+
+                    let (anchored_block, block_size, block_execution_cost) = StacksBlockBuilder::build_anchored_block(
+                        chainstate,
+                        &sortdb.index_conn(),
+                        &mempool,
+                        &parent_tip,
+                        tip.total_burn,
+                        vrf_proof,
+                        mblock_pubkey_hash,
+                        &coinbase_tx,
+                        ExecutionCost::max_value(),
+                    )
+                    .unwrap();
+
+                    // miner should have picked up the preprocessed microblocks, but only up to the
+                    // fork.
+                    if let Some((mblock_tail_hash, mblock_tail_seq)) = expected_parent_microblock_opt {
+                        assert_eq!(anchored_block.header.parent_microblock, mblock_tail_hash);
+                        assert_eq!(anchored_block.header.parent_microblock_sequence, mblock_tail_seq);
+                        assert_eq!(mblock_tail_seq, 1);
+                    }
+
+                    // block should contain at least one poison-microblock tx
+                    if tenure_id > 0 {
+                        let mut have_poison_microblock = false;
+                        for tx in anchored_block.txs.iter() {
+                            if let TransactionPayload::PoisonMicroblock(_, _) = &tx.payload {
+                                have_poison_microblock = true;
+                            }
+                        }
+                        assert!(have_poison_microblock, "Anchored block has no poison microblock: {:#?}", &anchored_block);
+                    }
+
+                    (anchored_block, vec![])
+                },
+            );
+
+            last_block = Some(stacks_block.clone());
+
+            peer.next_burnchain_block(burn_ops.clone());
+            peer.process_stacks_epoch_at_tip(&stacks_block, &microblocks);
+        }
+
+        for (i, addr) in addrs.iter().enumerate() {
+            let account = get_stacks_account(&mut peer, &addr.to_account_principal());
+            let expected_coinbase = 3_600_000_000;
+            test_debug!(
+                "Test {}: {}",
+                &account.principal.to_string(),
+                account.stx_balance.get_total_balance()
+            );
+            if (i as u64) < (num_blocks as u64) - MINER_REWARD_MATURITY - 1 {
+                assert_eq!(
+                    account.stx_balance.get_total_balance(),
+                    (initial_balance as u128)
+                        + (expected_coinbase * POISON_MICROBLOCK_COMMISSION_FRACTION) / 100
+                );
+            } else {
+                assert_eq!(
+                    account.stx_balance.get_total_balance(),
+                    initial_balance as u128
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_microblock_stream_forks_with_descendants() {
+        // creates a chainstate that looks like this:
+        //
+        //                                                   [mblock] <- [mblock] <- [tenure-2] (Poison-at-2)
+        //                                                 /
+        //                                          (2)   /
+        // [tenure-0] <- [mblock] <- [mblock] <- [mblock] <- [tenure-1] (Poison-at-2)
+        //                                                \
+        //                                                 \               (4)
+        //                                                   [mblock] <- [mblock] <- [tenure-3] (Poison-at-4)
+        //
+        //  Tenures 1 and 2 can report PoisonMicroblocks for the same point in the mblock stream
+        //  fork as long as they themselves are on different branches.
+        //
+        //  Tenure 3 can report a PoisonMicroblock for a lower point in the fork and have it mined
+        //  (seq(4)), as long as the PoisonMicroblock at seq(2) doesn't find its way into its fork
+        //  of the chain history.
+        let mut privks = vec![];
+        let mut addrs = vec![];
+        let mut mblock_privks = vec![];
+        let mut balances = vec![];
+        let num_blocks = 4;
+        let initial_balance = 100000000;
+
+        for _ in 0..num_blocks {
+            let privk = StacksPrivateKey::new();
+            let mblock_privk = StacksPrivateKey::new();
+
+            let addr = StacksAddress::from_public_keys(
+                C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+                &AddressHashMode::SerializeP2PKH,
+                1,
+                &vec![StacksPublicKey::from_private(&privk)],
+            )
+            .unwrap();
+
+            test_debug!("addr: {:?}", &addr);
+            addrs.push(addr.clone());
+            privks.push(privk);
+            mblock_privks.push(mblock_privk);
+            balances.push((addr.to_account_principal(), initial_balance));
+        }
+
+        let mut peer_config = TestPeerConfig::new(
+            "test_build_microblock_stream_forks_with_descendants",
+            2014,
+            2015,
+        );
+        peer_config.initial_balances = balances;
+
+        let mut peer = TestPeer::new(peer_config);
+
+        let chainstate_path = peer.chainstate_path.clone();
+
+        let first_stacks_block_height = {
+            let sn =
+                SortitionDB::get_canonical_burn_chain_tip(&peer.sortdb.as_ref().unwrap().conn())
+                    .unwrap();
+            sn.block_height
+        };
+
+        let recipient_addr_str = "ST1RFD5Q2QPK3E0F08HG9XDX7SSC7CNRS0QR0SGEV";
+        let recipient = StacksAddress::from_string(recipient_addr_str).unwrap();
+
+        let mut microblock_tail_1: Option<StacksMicroblockHeader> = None;
+        let mut microblock_tail_2: Option<StacksMicroblockHeader> = None;
+
+        let mut parent_tip_1 = None;
+
+        let parent_block_ptrs = RefCell::new(HashMap::new());
+        let discovered_poison_payload = RefCell::new(None);
+
+        let mut reporters = vec![];
+
+        for tenure_id in 0..num_blocks {
+            // send transactions to the mempool
+            let tip =
+                SortitionDB::get_canonical_burn_chain_tip(&peer.sortdb.as_ref().unwrap().conn())
+                    .unwrap();
+
+            let (mut burn_ops, stacks_block, microblocks) = peer.make_tenure(
+                |ref mut miner,
+                 ref mut sortdb,
+                 ref mut chainstate,
+                 vrf_proof,
+                 ref parent_opt,
+                 ref parent_microblock_header_opt| {
+                    let mut parent_tip =
+                        if tenure_id == 0 || tenure_id == 1 {
+                            let tip = match parent_opt {
+                                None => StacksChainState::get_genesis_header_info(chainstate.db())
+                                    .unwrap(),
+                                Some(block) => {
+                                    let ic = sortdb.index_conn();
+                                    let snapshot =
+                                        SortitionDB::get_block_snapshot_for_winning_stacks_block(
+                                            &ic,
+                                            &tip.sortition_id,
+                                            &block.block_hash(),
+                                        )
+                                        .unwrap()
+                                        .unwrap(); // succeeds because we don't fork
+                                    StacksChainState::get_anchored_block_header_info(
+                                        chainstate.db(),
+                                        &snapshot.consensus_hash,
+                                        &snapshot.winning_stacks_block_hash,
+                                    )
+                                    .unwrap()
+                                    .unwrap()
+                                }
+                            };
+                            if tenure_id == 1 {
+                                // save this for later
+                                parent_tip_1 = Some(tip.clone());
+                            }
+                            tip
+                        }
+                        else if tenure_id == 2 || tenure_id == 3 {
+                            // tenures 2 and 3 build off of microblock forks, but they share the
+                            // same parent anchored block.
+                            parent_tip_1.clone().unwrap()
+                        }
+                        else {
+                            unreachable!()
+                        };
+
+                    let parent_header_hash = parent_tip.anchored_header.block_hash();
+                    let parent_consensus_hash = parent_tip.consensus_hash.clone();
+                    let parent_index_hash = StacksBlockHeader::make_index_block_hash(&parent_consensus_hash, &parent_header_hash);
+                    let parent_size = parent_tip.anchored_block_size;
+
+                    let mut mempool = MemPoolDB::open(false, 0x80000000, &chainstate_path).unwrap();
+
+                    let (expected_parent_microblock_opt, fork_1, fork_2) =
+                        if tenure_id == 1 {
+                            // make a microblock fork
+                            let parent_microblock_privkey = mblock_privks[tenure_id - 1].clone();
+
+                            let parent_mblock_stream = {
+                                let parent_cost = StacksChainState::get_stacks_block_anchored_cost(chainstate.db(), &StacksBlockHeader::make_index_block_hash(&parent_consensus_hash, &parent_header_hash)).unwrap().unwrap();
+
+                                // produce the microblock stream for the parent, which this tenure's anchor
+                                // block will confirm.
+                                let sort_ic = sortdb.index_conn();
+
+                                chainstate
+                                    .reload_unconfirmed_state(&sort_ic, parent_index_hash.clone())
+                                    .unwrap();
+
+                                let mut microblock_builder = StacksMicroblockBuilder::new(parent_header_hash.clone(), parent_consensus_hash.clone(), chainstate, &sort_ic).unwrap();
+
+                                let mut microblocks = vec![];
+                                for i in 0..5 {
+                                    let mblock_tx = make_user_contract_publish(
+                                        &privks[tenure_id - 1],
+                                        i,
+                                        0,
+                                        &format!("hello-world-{}-{}", i, thread_rng().gen::<u64>()),
+                                        &format!("(begin (print \"{}\"))", thread_rng().gen::<u64>())
+                                    );
+                                    let mblock_tx_len = {
+                                        let mut bytes = vec![];
+                                        mblock_tx.consensus_serialize(&mut bytes).unwrap();
+                                        bytes.len() as u64
+                                    };
+
+                                    let mblock = microblock_builder.mine_next_microblock_from_txs(vec![(mblock_tx, mblock_tx_len)], &parent_microblock_privkey).unwrap();
+                                    microblocks.push(mblock);
+                                }
+                                microblocks
+                            };
+
+                            // make a fork at seq 2
+                            let mut forked_parent_microblock_stream = parent_mblock_stream.clone();
+                            for i in 2..parent_mblock_stream.len() {
+                                let forked_mblock_tx = make_user_contract_publish(
+                                    &privks[tenure_id - 1],
+                                    i as u64,
+                                    0,
+                                    &format!("hello-world-fork-{}-{}", i, thread_rng().gen::<u64>()),
+                                    &format!("(begin (print \"fork-{}\"))", thread_rng().gen::<u64>())
+                                );
+
+                                forked_parent_microblock_stream[i].txs[0] = forked_mblock_tx;
+
+                                // re-calculate merkle root
+                                let txid_vecs = forked_parent_microblock_stream[i].txs
+                                    .iter()
+                                    .map(|tx| tx.txid().as_bytes().to_vec())
+                                    .collect();
+
+                                let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&txid_vecs);
+                                let tx_merkle_root = merkle_tree.root();
+
+                                forked_parent_microblock_stream[i].header.tx_merkle_root = tx_merkle_root;
+                                forked_parent_microblock_stream[i].header.prev_block = forked_parent_microblock_stream[i - 1].block_hash();
+                                forked_parent_microblock_stream[i].header.sign(&parent_microblock_privkey).unwrap();
+
+                                test_debug!("parent of microblock {} is {}", &forked_parent_microblock_stream[i].block_hash(), &forked_parent_microblock_stream[i-1].block_hash());
+                            }
+
+                            let mut tail = None;
+
+                            // store two forks, which diverge at seq 2
+                            for mblock in parent_mblock_stream.iter() {
+                                if mblock.header.sequence < 2 {
+                                    tail = Some((mblock.block_hash(), mblock.header.sequence));
+                                }
+                                let stored = chainstate.preprocess_streamed_microblock(&parent_consensus_hash, &parent_header_hash, &mblock).unwrap();
+                                assert!(stored);
+                            }
+                            for mblock in forked_parent_microblock_stream[2..].iter() {
+                                let stored = chainstate.preprocess_streamed_microblock(&parent_consensus_hash, &parent_header_hash, mblock).unwrap();
+                                assert!(stored);
+                            }
+
+                            // find the poison-microblock at seq 2
+                            let (_, poison_opt) = match StacksChainState::load_descendant_staging_microblock_stream_with_poison(
+                                &chainstate.db(),
+                                &parent_index_hash,
+                                0,
+                                u16::MAX
+                            ).unwrap() {
+                                Some(x) => x,
+                                None => (vec![], None)
+                            };
+
+                            if let Some(poison_payload) = poison_opt {
+                                *discovered_poison_payload.borrow_mut() = Some(poison_payload.clone());
+
+                                let mut tx_bytes = vec![];
+                                let poison_microblock_tx = make_user_poison_microblock(
+                                    &privks[tenure_id - 1],
+                                    2,
+                                    0,
+                                    poison_payload
+                                );
+
+                                poison_microblock_tx
+                                    .consensus_serialize(&mut tx_bytes)
+                                    .unwrap();
+
+                                mempool
+                                    .submit_raw(
+                                        chainstate,
+                                        &parent_consensus_hash,
+                                        &parent_header_hash,
+                                        tx_bytes,
+                                    )
+                                    .unwrap();
+                            }
+
+                            // the miner will load a microblock stream up to the first detected
+                            // fork (which is at sequence 2 -- the highest common ancestor between
+                            // microblock fork #1 and microblock fork #2)
+                            (tail, Some(parent_mblock_stream), Some(forked_parent_microblock_stream))
+                        }
+                        else if tenure_id == 2 {
+                            // build off of the end of microblock fork #1
+                            (Some((microblock_tail_1.as_ref().unwrap().block_hash(), microblock_tail_1.as_ref().unwrap().sequence)), None, None)
+                        }
+                        else if tenure_id == 3 {
+                            // builds off of the end of microblock fork #2
+                            (Some((microblock_tail_2.as_ref().unwrap().block_hash(), microblock_tail_2.as_ref().unwrap().sequence)), None, None)
+                        }
+                        else {
+                            (None, None, None)
+                        };
+
+                    if tenure_id == 1 {
+                        // prep for tenure 2 and 3
+                        microblock_tail_1 = Some(fork_1.as_ref().unwrap().last().clone().unwrap().header.clone());
+                        microblock_tail_2 = Some(fork_2.as_ref().unwrap().last().clone().unwrap().header.clone());
+                    }
+
+                    let nonce =
+                        if tenure_id == 0 || tenure_id == 1 {
+                            tenure_id
+                        }
+                        else if tenure_id == 2 {
+                            1
+                        }
+                        else if tenure_id == 3 {
+                            1
+                        }
+                        else {
+                            unreachable!()
+                        };
+
+                    let coinbase_tx = make_coinbase_with_nonce(miner, tenure_id, nonce as u64);
+
+                    let mblock_pubkey_hash = Hash160::from_node_public_key(&StacksPublicKey::from_private(&mblock_privks[tenure_id]));
+
+                    test_debug!("Produce tenure {} block off of {}/{}", tenure_id, &parent_consensus_hash, &parent_header_hash);
+
+                    // force tenures 2 and 3 to mine off of forked siblings deeper than the
+                    // detected fork
+                    if tenure_id == 2 {
+                        parent_tip.microblock_tail = microblock_tail_1.clone();
+
+                        // submit the _same_ poison microblock transaction, but to a different
+                        // fork.
+                        let poison_payload = discovered_poison_payload.borrow().as_ref().unwrap().clone();
+                        let poison_microblock_tx = make_user_poison_microblock(
+                            &privks[tenure_id],
+                            0,
+                            0,
+                            poison_payload
+                        );
+
+                        let mut tx_bytes = vec![];
+                        poison_microblock_tx
+                            .consensus_serialize(&mut tx_bytes)
+                            .unwrap();
+
+                        mempool
+                            .submit_raw(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                tx_bytes,
+                            )
+                            .unwrap();
+                    }
+                    else if tenure_id == 3 {
+                        parent_tip.microblock_tail = microblock_tail_2.clone();
+
+                        // submit a different poison microblock transaction
+                        let poison_payload = TransactionPayload::PoisonMicroblock(microblock_tail_1.as_ref().unwrap().clone(), microblock_tail_2.as_ref().unwrap().clone());
+                        let poison_microblock_tx = make_user_poison_microblock(
+                            &privks[tenure_id],
+                            0,
+                            0,
+                            poison_payload
+                        );
+
+                        // erase any pending transactions -- this is a "worse" poison-microblock,
+                        // and we want to avoid mining the "better" one
+                        mempool.clear_before_height(10).unwrap();
+
+                        let mut tx_bytes = vec![];
+                        poison_microblock_tx
+                            .consensus_serialize(&mut tx_bytes)
+                            .unwrap();
+
+                        mempool
+                            .submit_raw(
+                                chainstate,
+                                &parent_consensus_hash,
+                                &parent_header_hash,
+                                tx_bytes,
+                            )
+                            .unwrap();
+                    }
+
+                    let (anchored_block, block_size, block_execution_cost) = StacksBlockBuilder::build_anchored_block(
+                        chainstate,
+                        &sortdb.index_conn(),
+                        &mempool,
+                        &parent_tip,
+                        parent_tip.anchored_header.total_work.burn + 1000,
+                        vrf_proof,
+                        mblock_pubkey_hash,
+                        &coinbase_tx,
+                        ExecutionCost::max_value(),
+                    )
+                    .unwrap();
+
+                    // miner should have picked up the preprocessed microblocks, but only up to the
+                    // fork tail reported.
+
+                    // block should contain at least one poison-microblock tx
+                    if tenure_id == 1 {
+                        if let Some((mblock_tail_hash, mblock_tail_seq)) = expected_parent_microblock_opt {
+                            assert_eq!(anchored_block.header.parent_microblock, mblock_tail_hash);
+                            assert_eq!(anchored_block.header.parent_microblock_sequence, mblock_tail_seq);
+                        }
+                    }
+                    if tenure_id > 0 {
+                        let mut have_poison_microblock = false;
+                        for tx in anchored_block.txs.iter() {
+                            if let TransactionPayload::PoisonMicroblock(_, _) = &tx.payload {
+                                have_poison_microblock = true;
+                                test_debug!("Have PoisonMicroblock for {} reported by {:?}", &anchored_block.block_hash(), &tx.auth);
+                            }
+                        }
+                        assert!(have_poison_microblock, "Anchored block has no poison microblock: {:#?}", &anchored_block);
+                    }
+
+                    // tenures 2 and 3 build off of 1, but build off of the deepest microblock fork
+                    if tenure_id == 2 {
+                        assert_eq!(anchored_block.header.parent_microblock, microblock_tail_1.as_ref().unwrap().block_hash());
+                        assert_eq!(anchored_block.header.parent_microblock_sequence, 4);
+                    }
+                    if tenure_id == 3 {
+                        assert_eq!(anchored_block.header.parent_microblock, microblock_tail_2.as_ref().unwrap().block_hash());
+                        assert_eq!(anchored_block.header.parent_microblock_sequence, 4);
+                    }
+
+                    let mut parent_ptrs = parent_block_ptrs.borrow_mut();
+                    parent_ptrs.insert(anchored_block.header.parent_block.clone(), parent_tip.burn_header_height);
+
+                    (anchored_block, vec![])
+                },
+            );
+
+            for burn_op in burn_ops.iter_mut() {
+                if let BlockstackOperationType::LeaderBlockCommit(ref mut op) = burn_op {
+                    // patch it up
+                    op.parent_block_ptr = (*parent_block_ptrs
+                        .borrow()
+                        .get(&stacks_block.header.parent_block)
+                        .unwrap()) as u32;
+                }
+            }
+
+            let (_, burn_header_hash, consensus_hash) = peer.next_burnchain_block(burn_ops.clone());
+            peer.process_stacks_epoch(&stacks_block, &consensus_hash, &microblocks);
+
+            if tenure_id >= 1 {
+                let next_tip = StacksChainState::get_anchored_block_header_info(
+                    peer.chainstate().db(),
+                    &consensus_hash,
+                    &stacks_block.block_hash(),
+                )
+                .unwrap()
+                .unwrap();
+
+                let new_tip_hash = StacksBlockHeader::make_index_block_hash(
+                    &next_tip.consensus_hash,
+                    &next_tip.anchored_header.block_hash(),
+                );
+
+                let reporter = if tenure_id == 1 {
+                    addrs[0].clone()
+                } else {
+                    addrs[tenure_id].clone()
+                };
+
+                let seq = if tenure_id == 1 || tenure_id == 2 {
+                    2
+                } else {
+                    4
+                };
+
+                // check descendant blocks for their poison-microblock commissions
+                test_debug!(
+                    "new tip at height {}: {}",
+                    next_tip.block_height,
+                    &new_tip_hash
+                );
+                reporters.push((reporter, new_tip_hash, seq));
+            }
+        }
+
+        // verify that each submitted poison-microblock created a commission
+        for (reporter_addr, chain_tip, seq) in reporters.into_iter() {
+            test_debug!("Check {} in {} for report", &reporter_addr, &chain_tip);
+            peer.with_db_state(|ref mut sortdb, ref mut chainstate, _, _| {
+                chainstate
+                    .with_read_only_clarity_tx(&sortdb.index_conn(), &chain_tip, |clarity_tx| {
+                        // the key at height 1 should be reported as poisoned
+                        let report = StacksChainState::get_poison_microblock_report(clarity_tx, 1)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(report.0, reporter_addr);
+                        assert_eq!(report.1, seq);
+                        Ok(())
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        }
+    }
+
     // TODO: invalid block with duplicate microblock public key hash (okay between forks, but not
     // within the same fork)
     // TODO: (BLOCKED) build off of different points in the same microblock stream
@@ -7042,6 +8265,5 @@ pub mod test {
     // TODO: confirm that if A is accepted but B is rejected, then C must also be rejected even if
     // it's on a different burnchain fork.
     // TODO: confirm that we can process B and C separately, even though they're the same block
-    // TODO: poison microblocks
     // TODO: verify that the Clarity MARF stores _only_ Clarity data
 }

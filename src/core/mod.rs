@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -39,6 +39,14 @@ pub const NETWORK_P2P_PORT: u16 = 6265;
 
 pub const MINING_COMMITMENT_WINDOW: u8 = 6;
 
+/// The number of blocks which will share the block bonus
+///   from burn blocks that occurred without a sortition.
+///   (See: https://forum.stacks.org/t/pox-consensus-and-stx-future-supply)
+#[cfg(test)]
+pub const INITIAL_MINING_BONUS_WINDOW: u16 = 10;
+#[cfg(not(test))]
+pub const INITIAL_MINING_BONUS_WINDOW: u16 = 10_000;
+
 // first burnchain block hash
 // TODO: update once we know the true first burnchain block
 pub const FIRST_BURNCHAIN_CONSENSUS_HASH: ConsensusHash = ConsensusHash([0u8; 20]);
@@ -59,8 +67,8 @@ pub const MICROSTACKS_PER_STACKS: u32 = 1_000_000;
 pub const POX_SUNSET_START: u64 = (FIRST_BURNCHAIN_BLOCK_HEIGHT as u64) + 100_000;
 pub const POX_SUNSET_END: u64 = POX_SUNSET_START + 400_000;
 
-pub const POX_PREPARE_WINDOW_LENGTH: u32 = 240;
-pub const POX_REWARD_CYCLE_LENGTH: u32 = 2000;
+pub const POX_PREPARE_WINDOW_LENGTH: u32 = 100;
+pub const POX_REWARD_CYCLE_LENGTH: u32 = 2100;
 /// The maximum amount that PoX rewards can be scaled by.
 ///  That is, if participation is very low, rewards are:
 ///      POX_MAXIMAL_SCALING x (rewards with 100% participation)
